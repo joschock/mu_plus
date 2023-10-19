@@ -23,7 +23,7 @@ use rust_advanced_logger_dxe::{debugln, DEBUG_INFO, DEBUG_WARN};
 
 use crate::{hid::HidContext, BOOT_SERVICES};
 
-// Usages supported by this driver.
+// Usages supported by this module.
 const GENERIC_DESKTOP_X: u32 = 0x00010030;
 const GENERIC_DESKTOP_Y: u32 = 0x00010031;
 const GENERIC_DESKTOP_Z: u32 = 0x00010032;
@@ -79,8 +79,7 @@ impl PointerHandler {
     let multiple_reports = descriptor.input_reports.len() > 1;
 
     for report in &descriptor.input_reports {
-      let mut report_data =
-        PointerReportData { report_id: report.report_id, report_size: report.size_in_bits / 8, ..Default::default() };
+      let mut report_data = PointerReportData { report_id: report.report_id, ..Default::default() };
 
       handler.report_id_present = report.report_id.is_some();
 
@@ -88,6 +87,8 @@ impl PointerHandler {
         //invalid to have None ReportId if multiple reports present.
         Err(efi::Status::DEVICE_ERROR)?;
       }
+
+      report_data.report_size = report.size_in_bits.div_ceil(8);
 
       for field in &report.fields {
         match field {
@@ -98,28 +99,24 @@ impl PointerHandler {
                   ReportFieldWithHandler { field: field.clone(), report_handler: Self::x_axis_handler };
                 report_data.relevant_fields.push(field_handler);
                 handler.supported_usages.insert(field.usage);
-                //debugln!(DEBUG_INFO, "x-axis field {:#?}", field);
               }
               GENERIC_DESKTOP_Y => {
                 let field_handler =
                   ReportFieldWithHandler { field: field.clone(), report_handler: Self::y_axis_handler };
                 report_data.relevant_fields.push(field_handler);
                 handler.supported_usages.insert(field.usage);
-                //debugln!(DEBUG_INFO, "y-axis field {:#?}", field);
               }
               GENERIC_DESKTOP_Z | GENERIC_DESKTOP_WHEEL => {
                 let field_handler =
                   ReportFieldWithHandler { field: field.clone(), report_handler: Self::z_axis_handler };
                 report_data.relevant_fields.push(field_handler);
                 handler.supported_usages.insert(field.usage);
-                //debugln!(DEBUG_INFO, "z-axis field {:#?}", field);
               }
               BUTTON_MIN..=BUTTON_MAX => {
                 let field_handler =
                   ReportFieldWithHandler { field: field.clone(), report_handler: Self::button_handler };
                 report_data.relevant_fields.push(field_handler);
                 handler.supported_usages.insert(field.usage);
-                //debugln!(DEBUG_INFO, "button field {:#?}", field);
               }
               _ => (), //other usages irrelevant
             }
@@ -136,7 +133,6 @@ impl PointerHandler {
     if handler.input_reports.len() > 0 {
       Ok(handler)
     } else {
-      debugln!(DEBUG_INFO, "No relevant fields for handler: {:#?}", handler);
       Err(efi::Status::UNSUPPORTED)
     }
   }
@@ -162,8 +158,8 @@ impl PointerHandler {
         wait_for_input: core::ptr::null_mut(),
       },
       handler: self,
-      controller: controller,
-      hid_context: hid_context,
+      controller,
+      hid_context,
     }));
 
     let context = unsafe { context_ptr.as_mut().expect("freshly boxed context pointer is null.") };
@@ -199,6 +195,45 @@ impl PointerHandler {
     }
 
     Ok(context_ptr)
+  }
+
+  // Uninstall the absolute pointer interface and free the Pointer context.
+  fn uninstall_pointer_interfaces(pointer_context: *mut PointerContext) -> Result<(), efi::Status> {
+    // retrieve a reference to boot services.
+    // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
+    // Caller should have ensured this, so just expect on failure.
+    let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
+
+    let absolute_pointer_ptr = raw_field!(pointer_context, PointerContext, absolute_pointer);
+
+    let mut overall_status = efi::Status::SUCCESS;
+
+    // close the wait_for_input event
+    let status = (boot_services.close_event)(unsafe { (*absolute_pointer_ptr).wait_for_input });
+    if status.is_error() {
+      overall_status = status;
+    }
+
+    // uninstall absolute pointer protocol
+    let status = (boot_services.uninstall_protocol_interface)(
+      unsafe { (*pointer_context).controller },
+      &absolute_pointer::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
+      absolute_pointer_ptr as *mut c_void,
+    );
+    if status.is_error() {
+      overall_status = status;
+    }
+
+    // take back the context and mode raw pointers
+    let context = unsafe { Box::from_raw(pointer_context) };
+    drop(unsafe { Box::from_raw(context.absolute_pointer.mode) });
+    drop(context);
+
+    if overall_status.is_error() {
+      Err(overall_status)
+    } else {
+      Ok(())
+    }
   }
 
   // Initializes the absolute_pointer mode structure.
@@ -334,45 +369,6 @@ impl PointerHandler {
       for field in report_data.relevant_fields {
         (field.report_handler)(self, field.field, report);
       }
-    }
-  }
-
-  // Uninstall the absolute pointer interface and free the Pointer context.
-  fn uninstall_pointer_interfaces(pointer_context: *mut PointerContext) -> Result<(), efi::Status> {
-    // retrieve a reference to boot services.
-    // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-    // Caller should have ensured this, so just expect on failure.
-    let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
-    let absolute_pointer_ptr = raw_field!(pointer_context, PointerContext, absolute_pointer);
-
-    let mut overall_status = efi::Status::SUCCESS;
-
-    // close the wait_for_input event
-    let status = (boot_services.close_event)(unsafe { (*absolute_pointer_ptr).wait_for_input });
-    if status.is_error() {
-      overall_status = status;
-    }
-
-    // uninstall absolute pointer protocol
-    let status = (boot_services.uninstall_protocol_interface)(
-      unsafe { (*pointer_context).controller },
-      &absolute_pointer::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
-      absolute_pointer_ptr as *mut c_void,
-    );
-    if status.is_error() {
-      overall_status = status;
-    }
-
-    // take back the context and mode raw pointers
-    let context = unsafe { Box::from_raw(pointer_context) };
-    drop(unsafe { Box::from_raw(context.absolute_pointer.mode) });
-    drop(context);
-
-    if overall_status.is_error() {
-      Err(overall_status)
-    } else {
-      Ok(())
     }
   }
 }
