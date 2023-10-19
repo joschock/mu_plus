@@ -30,7 +30,7 @@ use r_efi::{
   },
   system,
 };
-use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR, DEBUG_INFO, DEBUG_WARN};
+use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR, DEBUG_WARN};
 
 use crate::{
   hid::HidContext,
@@ -215,7 +215,6 @@ impl KeyboardHandler {
     }
 
     if handler.input_reports.len() > 0 || handler.output_builders.len() > 0 {
-      debugln!(DEBUG_INFO, "Handler: {:#x?}", handler);
       Ok(handler)
     } else {
       Err(efi::Status::UNSUPPORTED)
@@ -493,7 +492,7 @@ impl KeyboardHandler {
   fn build_led_report(&mut self, field: VariableField, report: &mut [u8]) {
     let status = field.set_field_value(self.led_state.contains(&field.usage).into(), report);
     if status.is_err() {
-      debugln!(DEBUG_WARN, "Failed to set field value: {:?}", status);
+      debugln!(DEBUG_WARN, "keyobard::build_led_report: failed to set field value: {:?}", status);
     }
   }
 
@@ -518,7 +517,7 @@ impl KeyboardHandler {
           report_buffer.as_mut_ptr() as *mut c_void,
         );
         if status.is_error() {
-          debugln!(DEBUG_WARN, "Set Report failed: {:?}", status);
+          debugln!(DEBUG_WARN, "keyboard::generate_led_report: Set Report failed: {:?}", status);
         }
       }
     }
@@ -946,7 +945,11 @@ pub(crate) fn install_default_layout(boot_services: &mut system::BootServices) -
   );
 
   if status.is_error() {
-    debugln!(DEBUG_ERROR, "Could not locate hii_database protocol to install keyboard layout: {:#x?}", status);
+    debugln!(
+      DEBUG_ERROR,
+      "keyboard::install_default_layout: Could not locate hii_database protocol to install keyboard layout: {:x?}",
+      status
+    );
     Err(status)?;
   }
 
@@ -962,11 +965,19 @@ pub(crate) fn install_default_layout(boot_services: &mut system::BootServices) -
   );
 
   if status.is_error() {
-    debugln!(DEBUG_ERROR, "Failed to install keyboard layout: {:#x?}", status);
+    debugln!(DEBUG_ERROR, "keyboard::install_default_layout: Failed to install keyboard layout package: {:x?}", status);
     Err(status)?;
   }
 
-  debugln!(DEBUG_ERROR, "layout installed");
+  let status = (hii_database_protocol.set_keyboard_layout)(
+    hii_database_protocol_ptr,
+    &hii_keyboard_layout::DEFAULT_KEYBOARD_LAYOUT_GUID as *const efi::Guid as *mut efi::Guid,
+  );
+
+  if status.is_error() {
+    debugln!(DEBUG_ERROR, "keyboard::install_default_layout: Failed to set keyboard layout: {:x?}", status);
+    Err(status)?;
+  }
 
   Ok(())
 }
@@ -1006,7 +1017,6 @@ extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut c_void) {
   );
 
   if status.is_error() {
-    debugln!(DEBUG_WARN, "Could not retrieve keyboard layout: {:#x?}", status);
     return;
   }
 
@@ -1016,7 +1026,7 @@ extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut c_void) {
       keyboard_context.handler.set_layout(Some(keyboard_layout));
     }
     Err(_) => {
-      debugln!(DEBUG_WARN, "Could parse keyboard layout buffer.");
+      debugln!(DEBUG_WARN, "keyboard::on_layout_update: Could not parse keyboard layout buffer.");
       return;
     }
   }

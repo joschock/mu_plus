@@ -19,7 +19,7 @@ use r_efi::{
   efi,
   protocols::{self, hii_database::*, simple_text_input::InputKey, simple_text_input_ex::*},
 };
-use rust_advanced_logger_dxe::{debugln, DEBUG_WARN};
+use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR, DEBUG_WARN};
 
 use crate::RUNTIME_SERVICES;
 
@@ -140,7 +140,7 @@ impl KeyQueue {
   pub(crate) fn keystroke(&mut self, key: Usage, action: KeyAction) {
     let Some(ref active_layout) = self.layout else {
       //nothing to do if no layout. This is unexpected: layout should be initialized with default if not present.
-      debugln!(DEBUG_WARN, "Received keystroke without layout.");
+      debugln!(DEBUG_WARN, "key_queue::keystroke: Received keystroke without layout.");
       return;
     };
 
@@ -215,7 +215,7 @@ impl KeyQueue {
     //handle ctrl-alt-delete
     if CTRL_MODIFIERS.iter().any(|x| self.active_modifiers.contains(x))
       && ALT_MODIFIERS.iter().any(|x| self.active_modifiers.contains(x))
-      && self.active_modifiers.contains(&DELETE_MODIFIER)
+      && current_descriptor.modifier == DELETE_MODIFIER
     {
       debugln!(DEBUG_WARN, "Ctrl-Alt-Del pressed, resetting system.");
       if let Some(runtime_services) = unsafe { RUNTIME_SERVICES.as_mut() } {
