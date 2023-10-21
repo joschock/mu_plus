@@ -2,10 +2,13 @@
 
 # Add packages that generate binaries here
 members = [
+  "AdvLoggerPkg/Crates/RustAdvancedLoggerDxe",
   "HidPkg/Crates/HidIo",
   "HidPkg/Crates/HiiKeyboardLayout",
   "HidPkg/UefiHidDxe",
-  "MsCorePkg/HelloWorldRustDxe"
+  "MsCorePkg/HelloWorldRustDxe",
+  "MsCorePkg/Crates/RustBootServicesAllocatorDxe",
+  "MsCorePkg/Crates/RustUnitTestUefiSupport",
 ]
 
 # Add packages that generate libraries here
