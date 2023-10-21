@@ -8,56 +8,55 @@
 //! SPDX-License-Identifier: BSD-2-Clause-Patent
 //!
 
-#![no_std]
-#![no_main]
+#![cfg_attr(target_os = "uefi", no_std)]
+#![cfg_attr(target_os = "uefi", no_main)]
 #![allow(non_snake_case)]
 
-extern crate alloc;
+#[cfg(target_os = "uefi")]
+mod uefi_entry {
+  extern crate alloc;
 
-use core::panic::PanicInfo;
+  use core::panic::PanicInfo;
 
-use driver_binding::initialize_driver_binding;
-use r_efi::{efi, system};
+  use r_efi::{efi, system};
+  use uefi_hid_dxe::{driver_binding::initialize_driver_binding, BOOT_SERVICES, RUNTIME_SERVICES};
 
-use rust_advanced_logger_dxe::{debugln, init_debug, DEBUG_ERROR};
-use rust_boot_services_allocator_dxe::GLOBAL_ALLOCATOR;
+  use rust_advanced_logger_dxe::{debugln, init_debug, DEBUG_ERROR};
+  use rust_boot_services_allocator_dxe::GLOBAL_ALLOCATOR;
 
-mod driver_binding;
-mod hid;
-mod key_queue;
-mod keyboard;
-mod pointer;
+  #[no_mangle]
+  pub extern "efiapi" fn efi_main(image_handle: efi::Handle, system_table: *const system::SystemTable) -> efi::Status {
+    // Safety: This block is unsafe because it assumes that system_table and (*system_table).boot_services are correct,
+    // and because it mutates/accesses the global BOOT_SERVICES static.
+    unsafe {
+      BOOT_SERVICES = (*system_table).boot_services;
+      RUNTIME_SERVICES = (*system_table).runtime_services;
+      GLOBAL_ALLOCATOR.init(BOOT_SERVICES);
+      init_debug(BOOT_SERVICES);
+    }
 
-static mut BOOT_SERVICES: *mut system::BootServices = core::ptr::null_mut();
-static mut RUNTIME_SERVICES: *mut system::RuntimeServices = core::ptr::null_mut();
+    let status = initialize_driver_binding(image_handle);
 
-#[no_mangle]
-pub extern "efiapi" fn efi_main(image_handle: efi::Handle, system_table: *const system::SystemTable) -> efi::Status {
-  // Safety: This block is unsafe because it assumes that system_table and (*system_table).boot_services are correct,
-  // and because it mutates/accesses the global BOOT_SERVICES static.
-  unsafe {
-    BOOT_SERVICES = (*system_table).boot_services;
-    RUNTIME_SERVICES = (*system_table).runtime_services;
-    GLOBAL_ALLOCATOR.init(BOOT_SERVICES);
-    init_debug(BOOT_SERVICES);
+    if status.is_err() {
+      debugln!(DEBUG_ERROR, "[UefiHidMain]: failed to initialize driver binding.\n");
+    }
+
+    efi::Status::SUCCESS
   }
 
-  let status = initialize_driver_binding(image_handle);
+  //Workaround for https://github.com/rust-lang/rust/issues/98254
+  #[rustversion::before(1.73)]
+  #[no_mangle]
+  pub extern "efiapi" fn __chkstk() {}
 
-  if status.is_err() {
-    debugln!(DEBUG_ERROR, "[UefiHidMain]: failed to initialize driver binding.\n");
+  #[panic_handler]
+  fn panic(info: &PanicInfo) -> ! {
+    debugln!(DEBUG_ERROR, "Panic: {:?}", info);
+    loop {}
   }
-
-  efi::Status::SUCCESS
 }
 
-//Workaround for https://github.com/rust-lang/rust/issues/98254
-#[rustversion::before(1.73)]
-#[no_mangle]
-pub extern "efiapi" fn __chkstk() {}
-
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-  debugln!(DEBUG_ERROR, "Panic: {:?}", info);
-  loop {}
+#[cfg(not(target_os = "uefi"))]
+fn main() {
+  //do nothing.
 }
