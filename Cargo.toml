@@ -5,13 +5,15 @@ members = [
   "HidPkg/Crates/HidIo",
   "HidPkg/Crates/HiiKeyboardLayout",
   "HidPkg/UefiHidDxe",
-  "MsCorePkg/HelloWorldRustDxe"
+  "MsCorePkg/HelloWorldRustDxe",
+  "MsCorePkg/Crates/RustBootServices"
 ]
 
 # Add packages that generate libraries here
 [workspace.dependencies]
 RustAdvancedLoggerDxe = {path = "AdvLoggerPkg/Crates/RustAdvancedLoggerDxe"}
 RustBootServicesAllocatorDxe = {path = "MsCorePkg/Crates/RustBootServicesAllocatorDxe"}
+RustBootServices = {path = "MsCorePkg/Crates/RustBootServices"}
 HidIo = {path = "HidPkg/Crates/HidIo"}
 HiiKeyboardLayout = {path = "HidPkg/Crates/HiiKeyboardLayout"}
 
