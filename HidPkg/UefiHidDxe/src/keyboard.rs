@@ -31,6 +31,7 @@ use r_efi::{
   system,
 };
 use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR, DEBUG_WARN};
+use rust_boot_services::UefiBootServices;
 
 use crate::{
   hid::HidContext,
@@ -102,7 +103,7 @@ pub struct KeyboardHandler {
   notification_callbacks: BTreeMap<usize, (OrdKeyData, protocols::simple_text_input_ex::KeyNotifyFunction)>,
   next_notify_handle: usize,
   key_notify_event: efi::Event,
-  hid_io: *mut hid_io::protocol::Protocol,
+  hid_io: *const hid_io::protocol::Protocol,
 }
 
 impl KeyboardHandler {
@@ -224,14 +225,10 @@ impl KeyboardHandler {
   //Create the Keyboard Context and install the SimpleTextIn/SimpleTextInEx interfaces.
   fn install_keyboard_interfaces(
     self,
+    boot_services: &impl UefiBootServices,
     controller: efi::Handle,
     hid_context: *mut HidContext,
   ) -> Result<*mut KeyboardContext, efi::Status> {
-    // retrieve a reference to boot services.
-    // Safety: BOOT_SERVICES must ahve been initialized to point to the UEFI Boot Services table.
-    // Caller should have ensured this, so just expect on failure.
-    let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
     // Create keyboard context. This context is shared across FFI boundary, so use Box::into_raw.
     // After creation, the only way to access the context (including the handler instance) is via raw pointer.
     let context_ptr = Box::into_raw(Box::new(KeyboardContext {
@@ -256,7 +253,7 @@ impl KeyboardHandler {
     let context = unsafe { context_ptr.as_mut().expect("freshly boxed context pointer is null") };
     //create wait_for_key events.
     let mut wait_for_key_event: efi::Event = core::ptr::null_mut();
-    let status = (boot_services.create_event)(
+    let status = boot_services.create_event(
       system::EVT_NOTIFY_WAIT,
       system::TPL_NOTIFY,
       Some(wait_for_key),
@@ -270,7 +267,7 @@ impl KeyboardHandler {
     context.simple_text_in.wait_for_key = wait_for_key_event;
 
     let mut wait_for_key_ex_event: efi::Event = core::ptr::null_mut();
-    let status = (boot_services.create_event)(
+    let status = boot_services.create_event(
       system::EVT_NOTIFY_WAIT,
       system::TPL_NOTIFY,
       Some(wait_for_key),
@@ -278,7 +275,7 @@ impl KeyboardHandler {
       core::ptr::addr_of_mut!(wait_for_key_ex_event),
     );
     if status.is_error() {
-      (boot_services.close_event)(wait_for_key_event);
+      boot_services.close_event(wait_for_key_event);
       drop(unsafe { Box::from_raw(context_ptr) });
       return Err(status);
     }
@@ -288,7 +285,7 @@ impl KeyboardHandler {
     //per UEFI spec 2.10 section 12.2.5. The keyboard handler interfaces may run at a higher TPL, so this event is used
     //to dispatch the key notifies at the required TPL level.
     let mut key_notify_event: efi::Event = core::ptr::null_mut();
-    let status = (boot_services.create_event)(
+    let status = boot_services.create_event(
       system::EVT_NOTIFY_SIGNAL,
       system::TPL_CALLBACK,
       Some(process_key_notifies),
@@ -296,8 +293,8 @@ impl KeyboardHandler {
       core::ptr::addr_of_mut!(key_notify_event),
     );
     if status.is_error() {
-      (boot_services.close_event)(wait_for_key_event);
-      (boot_services.close_event)(wait_for_key_ex_event);
+      boot_services.close_event(wait_for_key_event);
+      boot_services.close_event(wait_for_key_ex_event);
       drop(unsafe { Box::from_raw(context_ptr) });
       return Err(status);
     }
@@ -306,7 +303,7 @@ impl KeyboardHandler {
     //install simple_text_in and simple_text_in_ex
     let mut controller = controller;
     let simple_text_in_ptr = raw_field!(context_ptr, KeyboardContext, simple_text_in);
-    let status = (boot_services.install_protocol_interface)(
+    let status = boot_services.install_protocol_interface(
       core::ptr::addr_of_mut!(controller),
       &protocols::simple_text_input::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
       efi::NATIVE_INTERFACE,
@@ -314,12 +311,12 @@ impl KeyboardHandler {
     );
 
     if status.is_error() {
-      let _ = deinitialize(context_ptr);
+      let _ = deinitialize(boot_services, context_ptr);
       return Err(status);
     }
 
     let simple_text_in_ex_ptr = raw_field!(context_ptr, KeyboardContext, simple_text_in_ex);
-    let status = (boot_services.install_protocol_interface)(
+    let status = boot_services.install_protocol_interface(
       core::ptr::addr_of_mut!(controller),
       &protocols::simple_text_input_ex::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
       efi::NATIVE_INTERFACE,
@@ -327,7 +324,7 @@ impl KeyboardHandler {
     );
 
     if status.is_error() {
-      let _ = deinitialize(context_ptr);
+      let _ = deinitialize(boot_services, context_ptr);
       return Err(status);
     }
 
@@ -337,33 +334,31 @@ impl KeyboardHandler {
   }
 
   // Uninstall the SimpleTextIn and SimpleTextInEx interfaces and free the Keyboard context.
-  fn uninstall_keyboard_interfaces(keyboard_context: *mut KeyboardContext) -> Result<(), efi::Status> {
-    // retrieve a reference to boot services.
-    // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-    // Caller should have ensured this, so just expect on failure.
-    let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
+  fn uninstall_keyboard_interfaces(
+    boot_services: &impl UefiBootServices,
+    keyboard_context: *mut KeyboardContext,
+  ) -> Result<(), efi::Status> {
     let simple_text_in_ptr = raw_field!(keyboard_context, KeyboardContext, simple_text_in);
     let simple_text_in_ex_ptr = raw_field!(keyboard_context, KeyboardContext, simple_text_in_ex);
 
     let mut overall_status = efi::Status::SUCCESS;
 
     // close the wait_for_key events
-    let status = (boot_services.close_event)(unsafe { (*simple_text_in_ptr).wait_for_key });
+    let status = boot_services.close_event(unsafe { (*simple_text_in_ptr).wait_for_key });
     if status.is_error() {
       overall_status = status;
     }
-    let status = (boot_services.close_event)(unsafe { (*simple_text_in_ex_ptr).wait_for_key_ex });
+    let status = boot_services.close_event(unsafe { (*simple_text_in_ex_ptr).wait_for_key_ex });
     if status.is_error() {
       overall_status = status;
     }
-    let status = (boot_services.close_event)(unsafe { (*keyboard_context).handler.key_notify_event });
+    let status = boot_services.close_event(unsafe { (*keyboard_context).handler.key_notify_event });
     if status.is_error() {
       overall_status = status;
     }
 
     //uninstall the protocol interfaces
-    let status = (boot_services.uninstall_protocol_interface)(
+    let status = boot_services.uninstall_protocol_interface(
       unsafe { (*keyboard_context).controller },
       &protocols::simple_text_input::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
       simple_text_in_ptr as *mut c_void,
@@ -371,7 +366,7 @@ impl KeyboardHandler {
     if status.is_error() {
       overall_status = status;
     }
-    let status = (boot_services.uninstall_protocol_interface)(
+    let status = boot_services.uninstall_protocol_interface(
       unsafe { (*keyboard_context).controller },
       &protocols::simple_text_input_ex::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
       simple_text_in_ex_ptr as *mut c_void,
@@ -423,7 +418,7 @@ impl KeyboardHandler {
   }
 
   // process the given input report buffer and handle input from it.
-  pub fn process_input_report(&mut self, report_buffer: &[u8]) {
+  pub fn process_input_report(&mut self, boot_services: &impl UefiBootServices, report_buffer: &[u8]) {
     if report_buffer.len() == 0 {
       return;
     }
@@ -475,8 +470,7 @@ impl KeyboardHandler {
         //after processing all the key strokes, check if any keys were pressed that should trigger the notifier callback
         //and if so, signal the event to trigger notify processing at the appropriate TPL.
         if self.key_queue.peek_notify_key().is_some() {
-          let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("bad boot services pointer") };
-          (boot_services.signal_event)(self.key_notify_event);
+          boot_services.signal_event(self.key_notify_event);
         }
 
         //after processing all the key strokes, send updated LED state if required.
@@ -499,7 +493,7 @@ impl KeyboardHandler {
   //generates and sends an output report for each output report in the report descriptor that indicated an LED usage
   //for an LED supported by this driver.
   pub fn generate_led_output_report(&mut self) {
-    let hid_io = unsafe { self.hid_io.as_mut().expect("bad hidio pointer") };
+    let hid_io = unsafe { self.hid_io.as_ref().expect("bad hidio pointer") };
     let current_leds: BTreeSet<Usage> = self.key_queue.get_active_leds().iter().cloned().collect();
     if current_leds != self.led_state {
       self.led_state = current_leds;
@@ -543,16 +537,17 @@ impl KeyboardHandler {
 /// Otherwise, a [`KeyboardContext`] that can be used to interact with this handler is returned. See [`KeyboardContext`]
 /// documentation for constraints on interactions with it.
 pub fn initialize(
+  boot_services: &impl UefiBootServices,
   controller: efi::Handle,
   descriptor: &ReportDescriptor,
   hid_context_ptr: *mut HidContext,
 ) -> Result<*mut KeyboardContext, efi::Status> {
   let handler = KeyboardHandler::process_descriptor(descriptor)?;
 
-  let context = handler.install_keyboard_interfaces(controller, hid_context_ptr)?;
+  let context = handler.install_keyboard_interfaces(boot_services, controller, hid_context_ptr)?;
 
-  if let Err(err) = initialize_keyboard_layout(context) {
-    let _ = deinitialize(context);
+  if let Err(err) = initialize_keyboard_layout(boot_services, context) {
+    let _ = deinitialize(boot_services, context);
     return Err(err);
   }
 
@@ -564,27 +559,23 @@ pub fn initialize(
 }
 
 /// De-initializes a keyboard handler described by `context` on the given `controller`.
-pub fn deinitialize(context: *mut KeyboardContext) -> Result<(), efi::Status> {
+pub fn deinitialize(boot_services: &impl UefiBootServices, context: *mut KeyboardContext) -> Result<(), efi::Status> {
   if context.is_null() {
     return Err(efi::Status::NOT_STARTED);
   }
-  KeyboardHandler::uninstall_keyboard_interfaces(context)
+  KeyboardHandler::uninstall_keyboard_interfaces(boot_services, context)
 }
 
 /// Attempt to retrieve a *mut HidContext for the given controller by locating the simple text input interfaces
 /// associated with the controller (if any) and deriving a PointerContext from it (which contains a pointer to the
 /// HidContext).
 pub fn attempt_to_retrieve_hid_context(
+  boot_services: &impl UefiBootServices,
   controller: efi::Handle,
   driver_binding: &driver_binding::Protocol,
 ) -> Result<*mut HidContext, efi::Status> {
-  // retrieve a reference to boot services.
-  // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-  // Caller should have ensured this, so just expect on failure.
-  let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
   let mut simple_text_in_ptr: *mut protocols::simple_text_input::Protocol = core::ptr::null_mut();
-  let status = (boot_services.open_protocol)(
+  let status = boot_services.open_protocol(
     controller,
     &protocols::simple_text_input::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
     core::ptr::addr_of_mut!(simple_text_in_ptr) as *mut *mut c_void,
@@ -612,12 +603,9 @@ extern "efiapi" fn wait_for_key(event: efi::Event, context: *mut c_void) {
   // retrieve a reference to the
   let keyboard_context = unsafe { (context as *mut KeyboardContext).as_mut().expect("Invalid context pointer") };
 
-  // retrieve a reference to boot services.
-  // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-  // Caller should have ensured this, so just expect on failure.
-  let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
+  let boot_services = &BOOT_SERVICES;
 
-  let old_tpl = (boot_services.raise_tpl)(system::TPL_NOTIFY);
+  let old_tpl = boot_services.raise_tpl(system::TPL_NOTIFY);
 
   loop {
     if let Some(key_data) = keyboard_context.handler.key_queue.peek_key() {
@@ -628,12 +616,12 @@ extern "efiapi" fn wait_for_key(event: efi::Event, context: *mut c_void) {
         continue;
       }
       //live non-partial key at front of queue; so signal event.
-      (boot_services.signal_event)(event);
+      boot_services.signal_event(event);
     }
     break;
   }
 
-  (boot_services.restore_tpl)(old_tpl);
+  boot_services.restore_tpl(old_tpl);
 }
 
 // Event callback function for handling registered key notifications. Iterates over the queue of keys to be notified,
@@ -641,16 +629,13 @@ extern "efiapi" fn wait_for_key(event: efi::Event, context: *mut c_void) {
 extern "efiapi" fn process_key_notifies(_event: efi::Event, context: *mut c_void) {
   let keyboard_context = unsafe { (context as *mut KeyboardContext).as_mut().expect("Invalid context pointer") };
 
-  // retrieve a reference to boot services.
-  // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-  // Caller should have ensured this, so just expect on failure.
-  let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
+  let boot_services = &BOOT_SERVICES;
 
   // loop through all the keys in the notification function queue and invoke the associated callback if found
   loop {
     //Safety: access to the key_queue needs to be at TPL_NOTIFY to ensure mutual exclusion, but this routine runs at
     //TPL_CALLBACK. So raise TPL to TPL_NOTIFY for the queue pop and callback function search.
-    let old_tpl = (boot_services.raise_tpl)(system::TPL_NOTIFY);
+    let old_tpl = boot_services.raise_tpl(system::TPL_NOTIFY);
 
     let (key, callback) = match keyboard_context.handler.key_queue.pop_notifiy_key() {
       Some(key) => {
@@ -666,7 +651,7 @@ extern "efiapi" fn process_key_notifies(_event: efi::Event, context: *mut c_void
       None => (None, None),
     };
     //restore TPL back to TPL_CALLBACK before actually invoking the callback.
-    (boot_services.restore_tpl)(old_tpl);
+    boot_services.restore_tpl(old_tpl);
 
     //Invoke the callback, if found.
     //Safety: this assumes that a caller doesn't "unregister" a callback and render the pointer invalid at TPL_NOTIFY
@@ -900,15 +885,13 @@ extern "efiapi" fn simple_text_in_ex_unregister_key_notify(
 
 // Initializes keyboard layout support. Creates an event to fire a callback when a new keyboard layout is installed
 // into HII database, and then installs a default keyboard layout if one is not already present.
-pub(crate) fn initialize_keyboard_layout(context_ptr: *mut KeyboardContext) -> Result<(), efi::Status> {
-  // retrieve a reference to boot services.
-  // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-  // Caller should have ensured this, so just expect on failure.
-  let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
+pub fn initialize_keyboard_layout(
+  boot_services: &impl UefiBootServices,
+  context_ptr: *mut KeyboardContext,
+) -> Result<(), efi::Status> {
   //create layout update event.
   let mut layout_change_event: efi::Event = core::ptr::null_mut();
-  let status = (boot_services.create_event_ex)(
+  let status = boot_services.create_event_ex(
     system::EVT_NOTIFY_SIGNAL,
     system::TPL_NOTIFY,
     Some(on_layout_update),
@@ -921,7 +904,7 @@ pub(crate) fn initialize_keyboard_layout(context_ptr: *mut KeyboardContext) -> R
   }
 
   //signal event to pick up any existing layout.
-  let status = (boot_services.signal_event)(layout_change_event);
+  let status = boot_services.signal_event(layout_change_event);
   if status.is_error() {
     Err(status)?;
   }
@@ -935,10 +918,10 @@ pub(crate) fn initialize_keyboard_layout(context_ptr: *mut KeyboardContext) -> R
 }
 
 // Installs a default keyboard layout into the HII database.
-pub(crate) fn install_default_layout(boot_services: &mut system::BootServices) -> Result<(), efi::Status> {
+pub fn install_default_layout(boot_services: &impl UefiBootServices) -> Result<(), efi::Status> {
   let mut hii_database_protocol_ptr: *mut protocols::hii_database::Protocol = core::ptr::null_mut();
 
-  let status = (boot_services.locate_protocol)(
+  let status = boot_services.locate_protocol(
     &protocols::hii_database::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
     core::ptr::null_mut(),
     core::ptr::addr_of_mut!(hii_database_protocol_ptr) as *mut *mut c_void,
@@ -989,10 +972,10 @@ extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut c_void) {
   // retrieve a reference to boot services.
   // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
   // Caller should have ensured this, so just expect on failure.
-  let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
+  let boot_services = &BOOT_SERVICES;
 
   let mut hii_database_protocol_ptr: *mut protocols::hii_database::Protocol = core::ptr::null_mut();
-  let status = (boot_services.locate_protocol)(
+  let status = boot_services.locate_protocol(
     &protocols::hii_database::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
     core::ptr::null_mut(),
     core::ptr::addr_of_mut!(hii_database_protocol_ptr) as *mut *mut c_void,

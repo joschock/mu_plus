@@ -1,6 +1,6 @@
 #![no_std]
 
-use core::ffi::c_void;
+use core::{ffi::c_void, sync::atomic::AtomicPtr};
 use r_efi::efi;
 
 pub trait UefiBootServices {
@@ -73,18 +73,25 @@ pub trait UefiBootServices {
 }
 
 pub struct StandardUefiBootServices {
-  boot_services: *const efi::BootServices,
+  boot_services: AtomicPtr<efi::BootServices>,
 }
 
 impl StandardUefiBootServices {
-  pub fn initialize(boot_services: *const efi::BootServices) -> Self {
-    Self { boot_services }
+  pub const fn new() -> Self {
+    Self { boot_services: AtomicPtr::new(core::ptr::null_mut()) }
+  }
+  pub fn initialize(&self, boot_services: *mut efi::BootServices) {
+    self.boot_services.store(boot_services, core::sync::atomic::Ordering::SeqCst)
   }
 
   fn boot_services(&self) -> &efi::BootServices {
-    unsafe { self.boot_services.as_ref().expect("invalid boot_services pointer") }
+    let boot_services_ptr = self.boot_services.load(core::sync::atomic::Ordering::SeqCst);
+    unsafe { boot_services_ptr.as_ref().expect("invalid boot_services pointer") }
   }
 }
+
+unsafe impl Sync for StandardUefiBootServices {}
+unsafe impl Send for StandardUefiBootServices {}
 
 impl UefiBootServices for StandardUefiBootServices {
   fn create_event(
