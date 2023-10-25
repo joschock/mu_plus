@@ -29,13 +29,13 @@ mod uefi_entry {
     // Safety: This block is unsafe because it assumes that system_table and (*system_table).boot_services are correct,
     // and because it mutates/accesses the global BOOT_SERVICES static.
     unsafe {
-      BOOT_SERVICES = (*system_table).boot_services;
+      BOOT_SERVICES.initialize((*system_table).boot_services);
       RUNTIME_SERVICES = (*system_table).runtime_services;
-      GLOBAL_ALLOCATOR.init(BOOT_SERVICES);
-      init_debug(BOOT_SERVICES);
+      GLOBAL_ALLOCATOR.init((*system_table).boot_services);
+      init_debug((*system_table).boot_services);
     }
 
-    let status = initialize_driver_binding(image_handle);
+    let status = initialize_driver_binding(&BOOT_SERVICES, image_handle);
 
     if status.is_err() {
       debugln!(DEBUG_ERROR, "[UefiHidMain]: failed to initialize driver binding.\n");

@@ -24,6 +24,7 @@ use r_efi::{
   system,
 };
 use rust_advanced_logger_dxe::{debugln, DEBUG_INFO, DEBUG_WARN};
+use rust_boot_services::UefiBootServices;
 
 use crate::{hid::HidContext, BOOT_SERVICES};
 
@@ -144,14 +145,10 @@ impl PointerHandler {
   // Create PointerContext structure and install Absolute Pointer interface.
   fn install_pointer_interfaces(
     self,
+    boot_services: &impl UefiBootServices,
     controller: efi::Handle,
     hid_context: *mut HidContext,
   ) -> Result<*mut PointerContext, efi::Status> {
-    // retrieve a reference to boot services.
-    // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-    // Caller should have ensured this, so just expect on failure.
-    let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
     // Create pointer context. This context is shared across FFI boundary, so use Box::into_raw.
     // After creation, the only way to access the context (including the handler instance) is via a raw pointer.
     let context_ptr = Box::into_raw(Box::new(PointerContext {
@@ -170,7 +167,7 @@ impl PointerHandler {
 
     // create event for wait_for_input.
     let mut wait_for_pointer_input_event: efi::Event = core::ptr::null_mut();
-    let status = (boot_services.create_event)(
+    let status = boot_services.create_event(
       system::EVT_NOTIFY_WAIT,
       system::TPL_NOTIFY,
       Some(wait_for_pointer),
@@ -186,7 +183,7 @@ impl PointerHandler {
     // install the absolute_pointer protocol.
     let mut controller = controller;
     let absolute_pointer_ptr = raw_field!(context_ptr, PointerContext, absolute_pointer);
-    let status = (boot_services.install_protocol_interface)(
+    let status = boot_services.install_protocol_interface(
       core::ptr::addr_of_mut!(controller),
       &absolute_pointer::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
       efi::NATIVE_INTERFACE,
@@ -194,7 +191,7 @@ impl PointerHandler {
     );
 
     if status.is_error() {
-      let _ = deinitialize(context_ptr);
+      let _ = deinitialize(boot_services, context_ptr);
       return Err(status);
     }
 
@@ -202,24 +199,22 @@ impl PointerHandler {
   }
 
   // Uninstall the absolute pointer interface and free the Pointer context.
-  fn uninstall_pointer_interfaces(pointer_context: *mut PointerContext) -> Result<(), efi::Status> {
-    // retrieve a reference to boot services.
-    // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-    // Caller should have ensured this, so just expect on failure.
-    let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
+  fn uninstall_pointer_interfaces(
+    boot_services: &impl UefiBootServices,
+    pointer_context: *mut PointerContext,
+  ) -> Result<(), efi::Status> {
     let absolute_pointer_ptr = raw_field!(pointer_context, PointerContext, absolute_pointer);
 
     let mut overall_status = efi::Status::SUCCESS;
 
     // close the wait_for_input event
-    let status = (boot_services.close_event)(unsafe { (*absolute_pointer_ptr).wait_for_input });
+    let status = boot_services.close_event(unsafe { (*absolute_pointer_ptr).wait_for_input });
     if status.is_error() {
       overall_status = status;
     }
 
     // uninstall absolute pointer protocol
-    let status = (boot_services.uninstall_protocol_interface)(
+    let status = boot_services.uninstall_protocol_interface(
       unsafe { (*pointer_context).controller },
       &absolute_pointer::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
       absolute_pointer_ptr as *mut c_void,
@@ -349,7 +344,7 @@ impl PointerHandler {
   }
 
   /// Processes the given input report buffer and handles input from it.
-  pub fn process_input_report(&mut self, report_buffer: &[u8]) {
+  pub fn process_input_report(&mut self, _boot_services: &impl UefiBootServices, report_buffer: &[u8]) {
     if report_buffer.len() == 0 {
       return;
     }
@@ -386,13 +381,14 @@ impl PointerHandler {
 /// Otherwise, a [`PointerContext`] that can be used to interact with this handler is returned. See [`PointerContext`]
 /// documentation for constraints on interactions with it.
 pub fn initialize(
+  boot_services: &impl UefiBootServices,
   controller: efi::Handle,
   descriptor: &ReportDescriptor,
   hid_context_ptr: *mut HidContext,
 ) -> Result<*mut PointerContext, efi::Status> {
   let handler = PointerHandler::process_descriptor(descriptor)?;
 
-  let context = handler.install_pointer_interfaces(controller, hid_context_ptr)?;
+  let context = handler.install_pointer_interfaces(boot_services, controller, hid_context_ptr)?;
 
   let hid_context = unsafe { hid_context_ptr.as_mut().expect("[pointer::initialize]: bad hid context pointer") };
 
@@ -402,26 +398,22 @@ pub fn initialize(
 }
 
 /// De-initializes a pointer handler described by `context` on the given `controller`.
-pub fn deinitialize(context: *mut PointerContext) -> Result<(), efi::Status> {
+pub fn deinitialize(boot_services: &impl UefiBootServices, context: *mut PointerContext) -> Result<(), efi::Status> {
   if context.is_null() {
     return Err(efi::Status::NOT_STARTED);
   }
-  PointerHandler::uninstall_pointer_interfaces(context)
+  PointerHandler::uninstall_pointer_interfaces(boot_services, context)
 }
 
 /// Attempt to retrieve a *mut HidContext for the given controller by locating the absolute_pointer interface associated
 /// with the controller (if any) and deriving a PointerContext from it (which contains a pointer to the HidContext).
 pub fn attempt_to_retrieve_hid_context(
+  boot_services: &impl UefiBootServices,
   controller: efi::Handle,
   driver_binding: &driver_binding::Protocol,
 ) -> Result<*mut HidContext, efi::Status> {
-  // retrieve a reference to boot services.
-  // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-  // Caller should have ensured this, so just expect on failure.
-  let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
   let mut absolute_pointer_ptr: *mut absolute_pointer::Protocol = core::ptr::null_mut();
-  let status = (boot_services.open_protocol)(
+  let status = boot_services.open_protocol(
     controller,
     &absolute_pointer::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
     core::ptr::addr_of_mut!(absolute_pointer_ptr) as *mut *mut c_void,
@@ -446,17 +438,14 @@ pub fn attempt_to_retrieve_hid_context(
 
 // event handler for wait_for_pointer event that is part of the absolute pointer interface.
 extern "efiapi" fn wait_for_pointer(event: efi::Event, context: *mut c_void) {
-  // retrieve a reference to boot services.
-  // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
-  // Caller should have ensured this, so just expect on failure.
-  let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
+  let boot_services = &BOOT_SERVICES;
 
   // retrieve a reference to pointer context.
   // Safety: Pointer Context must have been initialized before this event could fire, so just expect on failure.
   let pointer_context = unsafe { (context as *mut PointerContext).as_mut().expect("Pointer Context is bad.") };
 
   if pointer_context.handler.state_changed {
-    (boot_services.signal_event)(event);
+    boot_services.signal_event(event);
   }
 }
 
