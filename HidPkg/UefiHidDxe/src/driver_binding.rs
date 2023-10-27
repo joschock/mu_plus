@@ -151,7 +151,7 @@ fn hid_driver_binding_start(
   controller: efi::Handle,
 ) -> efi::Status {
   // initialize the hid stack
-  let status = hid::initialize(boot_services, controller, this);
+  let status = hid::initialize(boot_services, controller, this.driver_binding_handle, Vec::new());
   if let Err(status) = status {
     debugln!(DEBUG_INFO, "[hid::driver_binding_start] failed to initialize hid: {:x?}", status);
     return status;
@@ -162,11 +162,11 @@ fn hid_driver_binding_start(
 
 fn hid_driver_binding_stop(
   boot_services: &impl UefiBootServices,
-  this: &protocols::driver_binding::Protocol,
+  _this: &protocols::driver_binding::Protocol,
   controller: efi::Handle,
 ) -> efi::Status {
   //destroy the hid stack.
-  let status = hid::destroy(boot_services, controller, this);
+  let status = hid::destroy(boot_services, controller);
   if let Err(status) = status {
     debugln!(DEBUG_INFO, "[hid::driver_binding_stop] failed to destroy hid: {:x?}", status);
     return status;

@@ -7,26 +7,13 @@
 //! Copyright (c) Microsoft Corporation. All rights reserved.
 //! SPDX-License-Identifier: BSD-2-Clause-Patent
 //!
-use alloc::{
-  boxed::Box,
-  collections::{BTreeMap, BTreeSet},
-  vec::Vec,
-};
-use core::ffi::c_void;
-use hidparser::{
-  report_data_types::{ReportId, Usage},
-  ReportDescriptor, ReportField, VariableField,
-};
-use memoffset::{offset_of, raw_field};
-use r_efi::{
-  efi,
-  protocols::{absolute_pointer, driver_binding},
-  system,
-};
-use rust_advanced_logger_dxe::{debugln, DEBUG_INFO, DEBUG_WARN};
-use rust_boot_services::UefiBootServices;
 
-use crate::{hid::HidContext, BOOT_SERVICES};
+use crate::hid::HidInputHandler;
+
+use alloc::collections::{BTreeSet, BTreeMap};
+use hidparser::{report_data_types::{ReportId, Usage}, VariableField, ReportField};
+use r_efi::{efi, protocols};
+use rust_boot_services::UefiBootServices;
 
 // Usages supported by this module.
 const GENERIC_DESKTOP_X: u32 = 0x00010030;
@@ -46,7 +33,6 @@ struct ReportFieldWithHandler {
   field: VariableField,
   report_handler: fn(&mut PointerHandler, field: VariableField, report: &[u8]),
 }
-
 // Defines a report and the fields of interest within it.
 #[derive(Debug, Default, Clone)]
 struct PointerReportData {
@@ -55,6 +41,166 @@ struct PointerReportData {
   relevant_fields: Vec<ReportFieldWithHandler>,
 }
 
+#[derive(Debug, Default)]
+pub struct PointerHandler {
+  input_reports: BTreeMap<Option<ReportId>, PointerReportData>,
+  report_id_present: bool,
+  supported_usages: BTreeSet<Usage>,
+  state_changed: bool,
+  current_state: protocols::absolute_pointer::State,
+}
+
+impl PointerHandler {
+  pub fn new() -> Self {
+    Default::default()
+  }
+
+  // Helper routine that handles projecting relative and absolute axis reports onto the fixed
+  // absolute report axis that this driver produces.
+  fn resolve_axis(current_value: u64, field: VariableField, report: &[u8]) -> Option<u64> {
+    if field.attributes.relative {
+      //for relative, just update and clamp the current state.
+      let new_value = current_value as i64 + field.field_value(report)?;
+      return Some(new_value.clamp(0, AXIS_RESOLUTION as i64) as u64);
+    } else {
+      //for absolute, project onto 0..AXIS_RESOLUTION
+      let mut new_value = field.field_value(report)?;
+
+      //translate to zero.
+      new_value = new_value.checked_sub(i32::from(field.logical_minimum) as i64)?;
+
+      //scale to AXIS_RESOLUTION
+      new_value = (new_value * AXIS_RESOLUTION as i64 * 1000) / (field.field_range()? as i64 * 1000);
+
+      return Some(new_value.clamp(0, AXIS_RESOLUTION as i64) as u64);
+    }
+  }
+
+  // handles x_axis inputs
+  fn x_axis_handler(&mut self, field: VariableField, report: &[u8]) {
+    if let Some(x_value) = Self::resolve_axis(self.current_state.current_x, field, report) {
+      self.current_state.current_x = x_value;
+      self.state_changed = true;
+    }
+  }
+
+  // handles y_axis inputs
+  fn y_axis_handler(&mut self, field: VariableField, report: &[u8]) {
+    if let Some(y_value) = Self::resolve_axis(self.current_state.current_y, field, report) {
+      self.current_state.current_y = y_value;
+      self.state_changed = true;
+    }
+  }
+
+  // handles z_axis inputs
+  fn z_axis_handler(&mut self, field: VariableField, report: &[u8]) {
+    if let Some(z_value) = Self::resolve_axis(self.current_state.current_z, field, report) {
+      self.current_state.current_z = z_value;
+      self.state_changed = true;
+    }
+  }
+
+  // handles button inputs
+  fn button_handler(&mut self, field: VariableField, report: &[u8]) {
+    let shift: u32 = field.usage.into();
+    if (shift < BUTTON_MIN) || (shift > BUTTON_MAX) {
+      return;
+    }
+
+    if let Some(button_value) = field.field_value(report) {
+      let button_value = button_value as u32;
+
+      let shift = shift - BUTTON_MIN;
+      if shift > u32::BITS {
+        return;
+      }
+      let button_value = button_value << shift;
+
+      self.current_state.active_buttons = self.current_state.active_buttons
+        & !(1 << shift)  // zero the relevant bit in the button state field.
+        | button_value; // or in the current button state into that bit position.
+
+      self.state_changed = true;
+    }
+  }
+
+  fn process_descriptor(&mut self, descriptor: &hidparser::ReportDescriptor) -> Result<(), efi::Status>{
+    let multiple_reports = descriptor.input_reports.len() > 1;
+
+    for report in &descriptor.input_reports {
+      let mut report_data = PointerReportData { report_id: report.report_id, ..Default::default() };
+
+      self.report_id_present = report.report_id.is_some();
+
+      if multiple_reports && !self.report_id_present {
+        //invalid to have None ReportId if multiple reports present.
+        Err(efi::Status::DEVICE_ERROR)?;
+      }
+
+      report_data.report_size = report.size_in_bits.div_ceil(8);
+
+      for field in &report.fields {
+        match field {
+          ReportField::Variable(field) => {
+            match field.usage.into() {
+              GENERIC_DESKTOP_X => {
+                let field_handler =
+                  ReportFieldWithHandler { field: field.clone(), report_handler: Self::x_axis_handler };
+                report_data.relevant_fields.push(field_handler);
+                self.supported_usages.insert(field.usage);
+              }
+              GENERIC_DESKTOP_Y => {
+                let field_handler =
+                  ReportFieldWithHandler { field: field.clone(), report_handler: Self::y_axis_handler };
+                report_data.relevant_fields.push(field_handler);
+                self.supported_usages.insert(field.usage);
+              }
+              GENERIC_DESKTOP_Z | GENERIC_DESKTOP_WHEEL => {
+                let field_handler =
+                  ReportFieldWithHandler { field: field.clone(), report_handler: Self::z_axis_handler };
+                report_data.relevant_fields.push(field_handler);
+                self.supported_usages.insert(field.usage);
+              }
+              BUTTON_MIN..=BUTTON_MAX => {
+                let field_handler =
+                  ReportFieldWithHandler { field: field.clone(), report_handler: Self::button_handler };
+                report_data.relevant_fields.push(field_handler);
+                self.supported_usages.insert(field.usage);
+              }
+              _ => (), //other usages irrelevant
+            }
+          }
+          _ => (), // other field types irrelevant
+        }
+      }
+
+      if report_data.relevant_fields.len() > 0 {
+        self.input_reports.insert(report_data.report_id, report_data);
+      }
+    }
+    if self.input_reports.len() > 0 {
+      Ok(())
+    } else {
+      Err(efi::Status::UNSUPPORTED)
+    }
+  }
+}
+
+impl HidInputHandler for PointerHandler {
+  fn initialize(&mut self, boot_services: &dyn UefiBootServices, controller: efi::Handle, descriptor: &hidparser::ReportDescriptor) -> Result<(), efi::Status>{
+    self.process_descriptor(descriptor)?;
+    todo!()
+  }
+
+  fn process_input_report(&mut self, report: &[u8]) {
+    todo!()
+  }
+  fn deinitialize(self, boot_services: &dyn UefiBootServices) -> Result<(), efi::Status> {
+    todo!()
+  }
+}
+
+/*
 /// Context structure used to track data for this pointer device.
 /// Safety: this structure is shared across FFI boundaries, and pointer arithmetic is used on its contents, so it must
 /// remain #[repr(C)], and Rust aliasing and concurrency rules must be manually enforced.
@@ -77,70 +223,7 @@ pub struct PointerHandler {
 }
 
 impl PointerHandler {
-  // processes a report descriptor and yields a PointerHandler instance if this descriptor describes input
-  // that can be handled by this PointerHandler.
-  fn process_descriptor(descriptor: &ReportDescriptor) -> Result<Self, efi::Status> {
-    let mut handler: PointerHandler = Default::default();
-    let multiple_reports = descriptor.input_reports.len() > 1;
 
-    for report in &descriptor.input_reports {
-      let mut report_data = PointerReportData { report_id: report.report_id, ..Default::default() };
-
-      handler.report_id_present = report.report_id.is_some();
-
-      if multiple_reports && !handler.report_id_present {
-        //invalid to have None ReportId if multiple reports present.
-        Err(efi::Status::DEVICE_ERROR)?;
-      }
-
-      report_data.report_size = report.size_in_bits.div_ceil(8);
-
-      for field in &report.fields {
-        match field {
-          ReportField::Variable(field) => {
-            match field.usage.into() {
-              GENERIC_DESKTOP_X => {
-                let field_handler =
-                  ReportFieldWithHandler { field: field.clone(), report_handler: Self::x_axis_handler };
-                report_data.relevant_fields.push(field_handler);
-                handler.supported_usages.insert(field.usage);
-              }
-              GENERIC_DESKTOP_Y => {
-                let field_handler =
-                  ReportFieldWithHandler { field: field.clone(), report_handler: Self::y_axis_handler };
-                report_data.relevant_fields.push(field_handler);
-                handler.supported_usages.insert(field.usage);
-              }
-              GENERIC_DESKTOP_Z | GENERIC_DESKTOP_WHEEL => {
-                let field_handler =
-                  ReportFieldWithHandler { field: field.clone(), report_handler: Self::z_axis_handler };
-                report_data.relevant_fields.push(field_handler);
-                handler.supported_usages.insert(field.usage);
-              }
-              BUTTON_MIN..=BUTTON_MAX => {
-                let field_handler =
-                  ReportFieldWithHandler { field: field.clone(), report_handler: Self::button_handler };
-                report_data.relevant_fields.push(field_handler);
-                handler.supported_usages.insert(field.usage);
-              }
-              _ => (), //other usages irrelevant
-            }
-          }
-          _ => (), // other field types irrelevant
-        }
-      }
-
-      if report_data.relevant_fields.len() > 0 {
-        handler.input_reports.insert(report_data.report_id, report_data);
-      }
-    }
-
-    if handler.input_reports.len() > 0 {
-      Ok(handler)
-    } else {
-      Err(efi::Status::UNSUPPORTED)
-    }
-  }
 
   // Create PointerContext structure and install Absolute Pointer interface.
   fn install_pointer_interfaces(
@@ -272,75 +355,6 @@ impl PointerHandler {
     }
 
     mode
-  }
-
-  // Helper routine that handles projecting relative and absolute axis reports onto the fixed
-  // absolute report axis that this driver produces.
-  fn resolve_axis(current_value: u64, field: VariableField, report: &[u8]) -> Option<u64> {
-    if field.attributes.relative {
-      //for relative, just update and clamp the current state.
-      let new_value = current_value as i64 + field.field_value(report)?;
-      return Some(new_value.clamp(0, AXIS_RESOLUTION as i64) as u64);
-    } else {
-      //for absolute, project onto 0..AXIS_RESOLUTION
-      let mut new_value = field.field_value(report)?;
-
-      //translate to zero.
-      new_value = new_value.checked_sub(i32::from(field.logical_minimum) as i64)?;
-
-      //scale to AXIS_RESOLUTION
-      new_value = (new_value * AXIS_RESOLUTION as i64 * 1000) / (field.field_range()? as i64 * 1000);
-
-      return Some(new_value.clamp(0, AXIS_RESOLUTION as i64) as u64);
-    }
-  }
-
-  // handles x_axis inputs
-  fn x_axis_handler(&mut self, field: VariableField, report: &[u8]) {
-    if let Some(x_value) = Self::resolve_axis(self.current_state.current_x, field, report) {
-      self.current_state.current_x = x_value;
-      self.state_changed = true;
-    }
-  }
-
-  // handles y_axis inputs
-  fn y_axis_handler(&mut self, field: VariableField, report: &[u8]) {
-    if let Some(y_value) = Self::resolve_axis(self.current_state.current_y, field, report) {
-      self.current_state.current_y = y_value;
-      self.state_changed = true;
-    }
-  }
-
-  // handles z_axis inputs
-  fn z_axis_handler(&mut self, field: VariableField, report: &[u8]) {
-    if let Some(z_value) = Self::resolve_axis(self.current_state.current_z, field, report) {
-      self.current_state.current_z = z_value;
-      self.state_changed = true;
-    }
-  }
-
-  // handles button inputs
-  fn button_handler(&mut self, field: VariableField, report: &[u8]) {
-    let shift: u32 = field.usage.into();
-    if (shift < BUTTON_MIN) || (shift > BUTTON_MAX) {
-      return;
-    }
-
-    if let Some(button_value) = field.field_value(report) {
-      let button_value = button_value as u32;
-
-      let shift = shift - BUTTON_MIN;
-      if shift > u32::BITS {
-        return;
-      }
-      let button_value = button_value << shift;
-
-      self.current_state.active_buttons = self.current_state.active_buttons
-        & !(1 << shift)  // zero the relevant bit in the button state field.
-        | button_value; // or in the current button state into that bit position.
-
-      self.state_changed = true;
-    }
   }
 
   /// Processes the given input report buffer and handles input from it.
@@ -503,3 +517,4 @@ extern "efiapi" fn absolute_pointer_get_state(
     efi::Status::NOT_READY
   }
 }
+ */

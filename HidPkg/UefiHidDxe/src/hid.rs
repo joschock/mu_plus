@@ -7,207 +7,259 @@
 //! Copyright (c) Microsoft Corporation. All rights reserved.
 //! SPDX-License-Identifier: BSD-2-Clause-Patent
 //!
-use core::{ffi::c_void, slice::from_raw_parts};
 
-use alloc::{boxed::Box, vec};
+mod uefi_interface {
+  use core::{ffi::c_void, slice::from_raw_parts};
+  use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR};
+  use rust_boot_services::UefiBootServices;
+  use r_efi::efi;
+  use alloc::{boxed::Box, vec, vec::Vec};
+  use super::HidHandlers;
 
-use r_efi::{efi, protocols::driver_binding, system};
-use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR, DEBUG_WARN};
+  pub type ReportCallback = fn(handlers: &mut HidHandlers, report: &[u8]);
+
+  struct CallbackContext {
+    callback: ReportCallback,
+    handlers: *mut HidHandlers,
+  }
+
+  pub struct UefiHidIo<'a> {
+    hid_io: *const hid_io::protocol::Protocol,
+    boot_services: &'a dyn UefiBootServices,
+    controller: efi::Handle,
+    agent: efi::Handle,
+    callback_context: Option<*mut CallbackContext>
+  }
+
+  impl<'a> UefiHidIo<'a> {
+    pub fn new(boot_services: &'a impl UefiBootServices, controller: efi::Handle, agent: efi::Handle) -> Result<UefiHidIo<'a>, efi::Status> {
+      // retrieve the HidIo instance for the given controller.
+      let mut hid_io: *mut hid_io::protocol::Protocol = core::ptr::null_mut();
+      let status = boot_services.open_protocol(
+        controller,
+        &hid_io::protocol::GUID as *const efi::Guid as *mut efi::Guid,
+        core::ptr::addr_of_mut!(hid_io) as *mut *mut c_void,
+        agent,
+        controller,
+        efi::OPEN_PROTOCOL_BY_DRIVER,
+      );
+      if status.is_error() {
+        return Err(status);
+      }
+      Ok(UefiHidIo {hid_io, boot_services, controller, agent, callback_context: None})
+    }
+
+    pub fn get_report_descriptor(&self) -> Result<Vec<u8>, efi::Status> {
+      let hid_io = unsafe {self.hid_io.as_ref().expect("bad hid io pointer")};
+      let mut report_descriptor_size = 0;
+
+      match (hid_io.get_report_descriptor)(
+        hid_io, core::ptr::addr_of_mut!(report_descriptor_size),
+        core::ptr::null_mut())
+      {
+        efi::Status::BUFFER_TOO_SMALL => (),
+        _ => return Err(efi::Status::DEVICE_ERROR)
+      };
+
+      let mut report_descriptor_buffer = vec![0u8; report_descriptor_size];
+      let report_descriptor_buffer_ptr = report_descriptor_buffer.as_mut_ptr();
+
+      match (hid_io.get_report_descriptor)(
+        hid_io, core::ptr::addr_of_mut!(report_descriptor_size),
+        report_descriptor_buffer_ptr as *mut c_void)
+      {
+        efi::Status::SUCCESS => (),
+        err => return Err(err)
+      };
+
+      Ok(report_descriptor_buffer)
+    }
+
+    pub fn _send_output_report(&self, report_id: Option<u8>, report: &[u8]) -> Result<(), efi::Status> {
+      let hid_io = unsafe {self.hid_io.as_ref().expect("bad hid io pointer")};
+
+      match (hid_io.set_report)(
+        self.hid_io,
+        report_id.unwrap_or(0),
+        hid_io::protocol::HidReportType::OutputReport,
+        report.len(),
+        report.as_ptr() as *mut c_void)
+      {
+        efi::Status::SUCCESS => Ok(()),
+        err => Err(err)
+      }
+    }
+
+    pub fn initiate_reports(&mut self, callback: ReportCallback, handlers: Box<HidHandlers>) ->Result<(), efi::Status> {
+      let hid_io = unsafe {self.hid_io.as_ref().expect("bad hid io pointer")};
+      let callback_context = Box::into_raw(Box::new(CallbackContext {
+        callback,
+        handlers: Box::into_raw(handlers)
+      }));
+
+      self.callback_context = Some(callback_context);
+
+      match (hid_io.register_report_callback)(self.hid_io, Self::on_input_report, callback_context as *mut c_void) {
+        efi::Status::SUCCESS => Ok(()),
+        err => {
+          let _ = self.terminate_reports();
+          Err(err)
+        },
+      }
+    }
+
+    pub fn terminate_reports(&mut self) -> Result<Box<HidHandlers>, efi::Status> {
+      let callback_context = self.callback_context.take().ok_or(efi::Status::NOT_STARTED)?;
+      let hid_io = unsafe {self.hid_io.as_ref().expect("bad hid io pointer")};
+
+      match (hid_io.unregister_report_callback)(self.hid_io, Self::on_input_report) {
+        efi::Status::NOT_STARTED | efi::Status::SUCCESS => (), //not started case may occur on init failure.
+        err => return Err(err),
+      };
+
+      let callback_context = unsafe {Box::from_raw(callback_context)};
+      Ok(unsafe {Box::from_raw(callback_context.handlers)})
+    }
+
+    extern "efiapi" fn on_input_report(report_buffer_size: u16, report_buffer: *mut c_void, context: *mut c_void) {
+      unsafe {
+        let report = from_raw_parts(report_buffer as *mut u8, report_buffer_size as usize);
+        let callback_context = (context as *mut CallbackContext).as_mut().expect("bad callback context ptr");
+        let context = callback_context.handlers.as_mut().expect("bad context pointer");
+        (callback_context.callback)(context, report);
+      };
+    }
+  }
+
+  impl Drop for UefiHidIo<'_> {
+    fn drop(&mut self) {
+      if self.callback_context.is_some() {
+        let _ = self.terminate_reports();
+      }
+      self.boot_services.close_protocol(
+        self.controller,
+        &hid_io::protocol::GUID as *const efi::Guid as *mut efi::Guid,
+        self.agent,
+        self.controller);
+    }
+  }
+
+  // private GUID used to save and retrieve a UefiHidIo context {3ae107d3-7249-4f45-8b99-32735a13999b}
+  const PRIVATE_CONTEXT_GUID: efi::Guid = efi::Guid::from_fields(
+      0x3ae107d3,
+      0x7249,
+      0x4f45,
+      0x8b,
+      0x99,
+      &[0x32, 0x73, 0x5a, 0x13, 0x99, 0x9b]);
+
+  pub fn save_hid_io_context(boot_services: &impl UefiBootServices, controller: efi::Handle, context: UefiHidIo) -> Result<(), efi::Status> {
+    let context_ptr = Box::into_raw(Box::new(context));
+
+    match boot_services.install_protocol_interface(
+      core::ptr::addr_of!(controller) as *mut efi::Handle,
+      &PRIVATE_CONTEXT_GUID as *const efi::Guid as *mut efi::Guid,
+      efi::NATIVE_INTERFACE,
+      context_ptr as *mut c_void)
+    {
+      efi::Status::SUCCESS => Ok(()),
+      err => Err(err)
+    }
+  }
+
+  pub fn _retrieve_hid_io_context(boot_services: &impl UefiBootServices, controller: efi::Handle) -> Result<UefiHidIo, efi::Status> {
+    let mut context_ptr: *mut UefiHidIo<'_> = core::ptr::null_mut();
+
+    match boot_services.open_protocol(
+      controller,
+      &PRIVATE_CONTEXT_GUID as *const efi::Guid as *mut efi::Guid,
+      core::ptr::addr_of_mut!(context_ptr) as *mut *mut c_void,
+      core::ptr::null_mut(),
+      controller,
+    efi::OPEN_PROTOCOL_GET_PROTOCOL)
+    {
+      efi::Status::SUCCESS =>  Ok(*unsafe{Box::from_raw(context_ptr)}),
+      err => Err(err)
+    }
+  }
+
+  pub fn remove_hid_io_context(boot_services: &impl UefiBootServices, controller: efi::Handle) -> Result<UefiHidIo, efi::Status> {
+    let mut context_ptr: *mut UefiHidIo<'_> = core::ptr::null_mut();
+
+    match boot_services.open_protocol(
+      controller,
+      &PRIVATE_CONTEXT_GUID as *const efi::Guid as *mut efi::Guid,
+      core::ptr::addr_of_mut!(context_ptr) as *mut *mut c_void,
+      core::ptr::null_mut(),
+      controller,
+    efi::OPEN_PROTOCOL_GET_PROTOCOL)
+    {
+      efi::Status::SUCCESS =>  (),
+      err => return Err(err)
+    };
+
+
+    match boot_services.uninstall_protocol_interface(
+      controller,
+      &PRIVATE_CONTEXT_GUID as *const efi::Guid as *mut efi::Guid,
+      context_ptr as *mut c_void)
+    {
+      efi::Status::SUCCESS => (),
+      err => debugln!(DEBUG_ERROR, "Unexpected status while removing context: {:x?}", err),
+    }
+
+    Ok(*unsafe{Box::from_raw(context_ptr)})
+  }
+}
+
+use alloc::{boxed::Box, vec::Vec};
+
+use hidparser::ReportDescriptor;
+use r_efi::{efi, protocols};
 use rust_boot_services::UefiBootServices;
 
-use crate::{keyboard, keyboard::KeyboardContext, pointer, pointer::PointerContext, BOOT_SERVICES};
+use crate::pointer::PointerHandler;
 
-pub struct HidContext {
-  pub hid_io: *mut hid_io::protocol::Protocol,
-  pub keyboard_context: *mut KeyboardContext,
-  pub pointer_context: *mut PointerContext,
+
+pub trait HidInputHandler {
+  fn initialize(&mut self, boot_services: &dyn UefiBootServices, controller: efi::Handle, descriptor: &ReportDescriptor) -> Result<(), efi::Status>;
+  fn process_input_report(&mut self, report: &[u8]);
+  fn deinitialize(self, boot_services: &dyn UefiBootServices) -> Result<(), efi::Status>;
 }
 
-/// Initialize HID support
-///
-/// Reads the HID Report Descriptor from the device, parse it, and initialize keyboard and pointer handlers for it.
-pub fn initialize(boot_services: &impl UefiBootServices, controller: efi::Handle, driver_binding: &driver_binding::Protocol) -> Result<(), efi::Status> {
-
-  // retrieve the HidIo instance for the given controller.
-  let mut hid_io_ptr: *mut hid_io::protocol::Protocol = core::ptr::null_mut();
-  let status = boot_services.open_protocol(
-    controller,
-    &hid_io::protocol::GUID as *const efi::Guid as *mut efi::Guid,
-    core::ptr::addr_of_mut!(hid_io_ptr) as *mut *mut c_void,
-    driver_binding.driver_binding_handle,
-    controller,
-    system::OPEN_PROTOCOL_BY_DRIVER,
-  );
-  if status.is_error() {
-    debugln!(DEBUG_ERROR, "[hid::initialize] Unexpected error opening HidIo protocol: {:#?}", status);
-    return Err(status);
-  }
-
-  let hid_io = unsafe { hid_io_ptr.as_ref().expect("bad hidio pointer.") };
-
-  //determine report descriptor size.
-  let mut report_descriptor_size: usize = 0;
-  let status =
-    (hid_io.get_report_descriptor)(hid_io, core::ptr::addr_of_mut!(report_descriptor_size), core::ptr::null_mut());
-
-  match status {
-    efi::Status::BUFFER_TOO_SMALL => (),
-    _ => {
-      let _ = release_hid_io(boot_services, controller, driver_binding);
-      return Err(efi::Status::DEVICE_ERROR);
-    }
-  }
-
-  //read report descriptor.
-  let mut report_descriptor_buffer = vec![0u8; report_descriptor_size];
-  let report_descriptor_buffer_ptr = report_descriptor_buffer.as_mut_ptr();
-
-  let status = (hid_io.get_report_descriptor)(
-    hid_io_ptr,
-    core::ptr::addr_of_mut!(report_descriptor_size),
-    report_descriptor_buffer_ptr as *mut c_void,
-  );
-
-  if status.is_error() {
-    let _ = release_hid_io(boot_services, controller, driver_binding);
-    return Err(status);
-  }
-
-  // parse the descriptor
-  let descriptor = hidparser::parse_report_descriptor(&report_descriptor_buffer).map_err(|err| {
-    debugln!(DEBUG_WARN, "[hid::initialize] failed to parse report descriptor: {:x?}.", err);
-    let _ = release_hid_io(boot_services, controller, driver_binding);
-    efi::Status::DEVICE_ERROR
-  })?;
-
-  // create hid context
-  let hid_context_ptr = Box::into_raw(Box::new(HidContext {
-    hid_io: hid_io_ptr,
-    keyboard_context: core::ptr::null_mut(),
-    pointer_context: core::ptr::null_mut(),
-  }));
-
-  //initialize report handlers
-  let keyboard = keyboard::initialize(boot_services, controller, &descriptor, hid_context_ptr);
-  let pointer = pointer::initialize(boot_services, controller, &descriptor, hid_context_ptr);
-
-  if keyboard.is_err() && pointer.is_err() {
-    debugln!(DEBUG_WARN, "[hid::initialize] no devices supported");
-    //no devices supported.
-    let _ = release_hid_io(boot_services, controller, driver_binding);
-    unsafe { drop(Box::from_raw(hid_context_ptr)) };
-    Err(efi::Status::UNSUPPORTED)?;
-  }
-
-  // register for input reports
-  let status = (hid_io.register_report_callback)(hid_io_ptr, on_input_report, hid_context_ptr as *mut c_void);
-
-  if status.is_error() {
-    debugln!(DEBUG_WARN, "[hid::initialize] failed to register for input reports: {:x?}", status);
-    let _ = destroy(boot_services, controller, driver_binding);
-    return Err(status);
-  }
-
-  Ok(())
+pub struct HidHandlers {
+  handlers: Vec<*mut dyn HidInputHandler>
 }
 
-// Handler function for input reports. Dispatches them to the keyboard and pointer modules for handling.
-extern "efiapi" fn on_input_report(report_buffer_size: u16, report_buffer: *mut c_void, context: *mut c_void) {
-  let hid_context_ptr = context as *mut HidContext;
-  let hid_context = unsafe { hid_context_ptr.as_mut().expect("[hid::on_input_report: invalid context pointer") };
+pub fn initialize(boot_services: &impl UefiBootServices, controller: efi::Handle, agent: efi::Handle, handlers: Vec<Box<dyn HidInputHandler>>) -> Result<(), efi::Status> {
+  let mut uefi_hid_io = uefi_interface::UefiHidIo::new(boot_services, controller, agent)?;
 
-  let report = unsafe { from_raw_parts(report_buffer as *mut u8, report_buffer_size as usize) };
+  let report_descriptor_buffer = uefi_hid_io.get_report_descriptor()?;
+  let report_descriptor = hidparser::parse_report_descriptor(&report_descriptor_buffer)
+    .map_err(|_|efi::Status::DEVICE_ERROR)?;
 
-  let keyboard_context = unsafe { hid_context.keyboard_context.as_mut() };
-  if let Some(keyboard_context) = keyboard_context {
-    keyboard_context.handler.process_input_report(&BOOT_SERVICES, report);
+  let mut hid_handlers = Box::new(HidHandlers {handlers: Vec::new()});
+
+  for handler in handlers {
+    hid_handlers.handlers.push(Box::into_raw(handler))
   }
 
-  let pointer_context = unsafe { hid_context.pointer_context.as_mut() };
-  if let Some(pointer_context) = pointer_context {
-    pointer_context.handler.process_input_report(&BOOT_SERVICES, report);
+  for handler in &hid_handlers.handlers {
+    unsafe {handler.as_mut().expect("bad pointer")}.initialize(boot_services, controller, &report_descriptor)?;
+  }
+
+  uefi_hid_io.initiate_reports(report_callback, hid_handlers)?;
+
+  uefi_interface::save_hid_io_context(boot_services, controller, uefi_hid_io)
+}
+
+fn report_callback(handlers: &mut HidHandlers, report: &[u8]) {
+  for handler in &handlers.handlers {
+    unsafe {handler.as_mut().expect("bad pointer")}.process_input_report(report)
   }
 }
 
-// Unregister report callback from HID layer to shutdown input reports.
-fn shutdown_input_reports(hid_context: &mut HidContext) -> Result<(), efi::Status> {
-  let hid_io =
-    unsafe { hid_context.hid_io.as_mut().expect("hid_context has bad hid_io pointer in hid::shutdown_input_reports") };
-  // shutdown input reports.
-  let status = (hid_io.unregister_report_callback)(hid_context.hid_io, on_input_report);
-  if status.is_error() {
-    debugln!(DEBUG_ERROR, "[hid::destroy] unexpected error from hid_io.unregister_report_callback: {:?}", status);
-    return Err(status);
-  }
-  Ok(())
-}
-
-//Shutdown Keyboard and Pointer handling.
-fn shutdown_handlers(boot_services: &impl UefiBootServices, hid_context: &mut HidContext) -> Result<(), efi::Status> {
-  // shutdown keyboard.
-  let mut status = efi::Status::SUCCESS;
-  match keyboard::deinitialize(boot_services, hid_context.keyboard_context) {
-    Err(err) if err != efi::Status::UNSUPPORTED => {
-      debugln!(DEBUG_ERROR, "[hid::destroy] unexpected error from keyboard::deinitialize: {:?}", err);
-      status = efi::Status::DEVICE_ERROR;
-    }
-    _ => (),
-  };
-
-  // shutdown pointer.
-  match pointer::deinitialize(boot_services, hid_context.pointer_context) {
-    Err(err) if err != efi::Status::UNSUPPORTED => {
-      debugln!(DEBUG_ERROR, "[hid::destroy] unexpected error from pointer::deinitialize: {:?}", err);
-      status = efi::Status::DEVICE_ERROR;
-    }
-    _ => (),
-  };
-
-  if status.is_error() {
-    return Err(status);
-  }
-
-  Ok(())
-}
-
-// Release HidIo instance by closing the HidIo protocol on the given controller.
-fn release_hid_io(boot_services: &impl UefiBootServices, controller: efi::Handle, driver_binding: &driver_binding::Protocol) -> Result<(), efi::Status> {
-
-  // release HidIo
-  match boot_services.close_protocol(
-    controller,
-    &hid_io::protocol::GUID as *const efi::Guid as *mut efi::Guid,
-    driver_binding.driver_binding_handle,
-    controller,
-  ) {
-    efi::Status::SUCCESS => (),
-    err => {
-      debugln!(DEBUG_ERROR, "[hid::release_hid_io] unexpected error from boot_services.close_protocol: {:?}", err);
-      return Err(efi::Status::DEVICE_ERROR);
-    }
-  }
-
-  Ok(())
-}
-
-/// Tears down HID support.
-///
-/// De-initializes keyboard and pointer handlers and releases HidIo instance.
-pub fn destroy(boot_services: &impl UefiBootServices, controller: efi::Handle, driver_binding: &driver_binding::Protocol) -> Result<(), efi::Status> {
-  let mut context = pointer::attempt_to_retrieve_hid_context(boot_services, controller, driver_binding);
-  if context.is_err() {
-    context = keyboard::attempt_to_retrieve_hid_context(boot_services, controller, driver_binding);
-  }
-
-  let hid_context_ptr = context?;
-  let hid_context = unsafe { hid_context_ptr.as_mut().expect("invalid hid_context_ptr in hid::destroy") };
-
-  let _ = shutdown_input_reports(hid_context);
-  let _ = shutdown_handlers(boot_services, hid_context);
-  let _ = release_hid_io(boot_services, controller, driver_binding);
-
-  // take back the hid_context (it will be released when it goes out of scope).
-  unsafe { drop(Box::from_raw(hid_context_ptr)) };
-
+pub fn destroy(boot_services: &impl UefiBootServices, controller: efi::Handle) -> Result<(), efi::Status> {
+  drop(uefi_interface::remove_hid_io_context(boot_services, controller)?);
   Ok(())
 }

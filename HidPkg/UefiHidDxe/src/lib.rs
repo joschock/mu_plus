@@ -4,8 +4,8 @@ extern crate alloc;
 
 pub mod driver_binding;
 mod hid;
-mod key_queue;
-mod keyboard;
+//mod key_queue;
+//mod keyboard;
 mod pointer;
 
 use r_efi::efi;
