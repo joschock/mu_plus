@@ -74,8 +74,9 @@ use alloc::boxed::Box;
 use r_efi::{efi, protocols};
 use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR, DEBUG_INFO};
 use rust_boot_services::UefiBootServices;
+use crate::hid::HidInputHandler;
 
-use crate::hid;
+use crate::{hid, supported_handlers};
 
 /// Initialize and install driver binding for this driver.
 ///
@@ -151,7 +152,7 @@ fn hid_driver_binding_start(
   controller: efi::Handle,
 ) -> efi::Status {
   // initialize the hid stack
-  let status = hid::initialize(boot_services, controller, this.driver_binding_handle, Vec::new());
+  let status = hid::initialize(boot_services, controller, this.driver_binding_handle, supported_handlers!());
   if let Err(status) = status {
     debugln!(DEBUG_INFO, "[hid::driver_binding_start] failed to initialize hid: {:x?}", status);
     return status;

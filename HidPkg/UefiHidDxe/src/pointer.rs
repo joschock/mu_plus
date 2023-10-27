@@ -8,6 +8,14 @@
 //! SPDX-License-Identifier: BSD-2-Clause-Patent
 //!
 
+mod uefi_interface {
+    use super::PointerHandler;
+
+  fn install_pointer_interfaces(handler: &mut PointerHandler) {
+    todo!()
+  }
+}
+
 use crate::hid::HidInputHandler;
 
 use alloc::collections::{BTreeSet, BTreeMap};
@@ -42,6 +50,7 @@ struct PointerReportData {
 }
 
 #[derive(Debug, Default)]
+#[repr(C)]
 pub struct PointerHandler {
   input_reports: BTreeMap<Option<ReportId>, PointerReportData>,
   report_id_present: bool,

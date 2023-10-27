@@ -215,10 +215,8 @@ mod uefi_interface {
 use alloc::{boxed::Box, vec::Vec};
 
 use hidparser::ReportDescriptor;
-use r_efi::{efi, protocols};
+use r_efi::efi;
 use rust_boot_services::UefiBootServices;
-
-use crate::pointer::PointerHandler;
 
 
 pub trait HidInputHandler {
@@ -238,6 +236,7 @@ pub fn initialize(boot_services: &impl UefiBootServices, controller: efi::Handle
   let report_descriptor = hidparser::parse_report_descriptor(&report_descriptor_buffer)
     .map_err(|_|efi::Status::DEVICE_ERROR)?;
 
+  //FFI note: handlers are boxed into raw pointers here because they are used to recover context as part of the FFI interfaces.
   let mut hid_handlers = Box::new(HidHandlers {handlers: Vec::new()});
 
   for handler in handlers {
