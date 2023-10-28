@@ -3,10 +3,7 @@
 extern crate alloc;
 
 pub mod driver_binding;
-mod hid;
-mod key_queue;
-mod keyboard;
-mod pointer;
+pub mod hid;
 
 use r_efi::efi;
 use rust_boot_services::StandardUefiBootServices;

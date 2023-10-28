@@ -15,14 +15,15 @@
 #[cfg(target_os = "uefi")]
 mod uefi_entry {
   extern crate alloc;
-
   use core::panic::PanicInfo;
 
+  use alloc::boxed::Box;
+
   use r_efi::{efi, system};
-  use uefi_hid_dxe::{driver_binding::initialize_driver_binding, BOOT_SERVICES, RUNTIME_SERVICES};
 
   use rust_advanced_logger_dxe::{debugln, init_debug, DEBUG_ERROR};
   use rust_boot_services_allocator_dxe::GLOBAL_ALLOCATOR;
+  use uefi_hid_dxe::{BOOT_SERVICES, RUNTIME_SERVICES, hid::Hid, driver_binding::UefiDriverBinding};
 
   #[no_mangle]
   pub extern "efiapi" fn efi_main(image_handle: efi::Handle, system_table: *const system::SystemTable) -> efi::Status {
@@ -35,19 +36,13 @@ mod uefi_entry {
       init_debug((*system_table).boot_services);
     }
 
-    let status = initialize_driver_binding(&BOOT_SERVICES, image_handle);
+    let hid = Box::new(Hid {});
 
-    if status.is_err() {
-      debugln!(DEBUG_ERROR, "[UefiHidMain]: failed to initialize driver binding.\n");
-    }
+    let hid_binding = UefiDriverBinding::new(&BOOT_SERVICES, hid, image_handle);
+    hid_binding.install().expect("failed to install HID driver binding");
 
     efi::Status::SUCCESS
   }
-
-  //Workaround for https://github.com/rust-lang/rust/issues/98254
-  #[rustversion::before(1.73)]
-  #[no_mangle]
-  pub extern "efiapi" fn __chkstk() {}
 
   #[panic_handler]
   fn panic(info: &PanicInfo) -> ! {
