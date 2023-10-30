@@ -23,6 +23,8 @@ HiiKeyboardLayout = {workspace=true}
 memoffset = {workspace=true}
 r-efi = {workspace=true}
 rustversion = {workspace=true}
-RustBootServices = {workspace=true}
 RustBootServicesAllocatorDxe = {workspace=true}
 RustAdvancedLoggerDxe = {workspace=true}
+
+[dev-dependencies]
+mockall = "0.11.4"

@@ -1,8 +1,9 @@
-#![no_std]
-
-use core::{ffi::c_void, sync::atomic::AtomicPtr};
+use core::{ffi::c_void, fmt::Debug, sync::atomic::AtomicPtr};
+#[cfg(test)]
+use mockall::automock;
 use r_efi::efi;
 
+#[cfg_attr(test, automock)]
 pub trait UefiBootServices {
   fn create_event(
     &self,
@@ -72,6 +73,7 @@ pub trait UefiBootServices {
   ) -> efi::Status;
 }
 
+#[derive(Debug)]
 pub struct StandardUefiBootServices {
   boot_services: AtomicPtr<efi::BootServices>,
 }

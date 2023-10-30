@@ -23,7 +23,7 @@ mod uefi_entry {
 
   use rust_advanced_logger_dxe::{debugln, init_debug, DEBUG_ERROR};
   use rust_boot_services_allocator_dxe::GLOBAL_ALLOCATOR;
-  use uefi_hid_dxe::{BOOT_SERVICES, RUNTIME_SERVICES, hid::Hid, driver_binding::UefiDriverBinding};
+  use uefi_hid_dxe::{driver_binding::UefiDriverBinding, hid::Hid, BOOT_SERVICES, RUNTIME_SERVICES};
 
   #[no_mangle]
   pub extern "efiapi" fn efi_main(image_handle: efi::Handle, system_table: *const system::SystemTable) -> efi::Status {

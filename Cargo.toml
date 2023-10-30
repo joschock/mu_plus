@@ -6,14 +6,12 @@ members = [
   "HidPkg/Crates/HiiKeyboardLayout",
   "HidPkg/UefiHidDxe",
   "MsCorePkg/HelloWorldRustDxe",
-  "MsCorePkg/Crates/RustBootServices"
 ]
 
 # Add packages that generate libraries here
 [workspace.dependencies]
 RustAdvancedLoggerDxe = {path = "AdvLoggerPkg/Crates/RustAdvancedLoggerDxe"}
 RustBootServicesAllocatorDxe = {path = "MsCorePkg/Crates/RustBootServicesAllocatorDxe"}
-RustBootServices = {path = "MsCorePkg/Crates/RustBootServices"}
 HidIo = {path = "HidPkg/Crates/HidIo"}
 HiiKeyboardLayout = {path = "HidPkg/Crates/HiiKeyboardLayout"}
 
@@ -24,3 +22,4 @@ rustversion = "1.0.14"
 spin = "0.9.8"
 memoffset = "0.9.0"
 scroll = { version = "0.11", default-features = false, features = ["derive"]}
+unimock = "0.5.5"
