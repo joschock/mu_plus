@@ -262,11 +262,8 @@ mod test {
     boot_services.expect_install_protocol_interface().returning(|_, _, _, _| efi::Status::SUCCESS);
 
     let mut binding = MockDriverBinding::new();
-
     binding.expect_driver_binding_supported().returning(|_, _| efi::Status::SUCCESS);
-
     binding.expect_driver_binding_start().returning(|_, _| efi::Status::SUCCESS);
-
     binding.expect_driver_binding_stop().returning(|_, _| efi::Status::SUCCESS);
 
     let handle = 0x1234 as efi::Handle;
