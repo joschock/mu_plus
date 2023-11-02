@@ -155,6 +155,8 @@ impl HidReportReciever for HidSplitter {
 
 #[cfg(test)]
 mod test {
+    use core::ffi::c_void;
+
     use r_efi::efi;
 
     use crate::{hid_io::{MockHidIoFactory, MockHidIo, MockHidReportReciever}, driver_binding::DriverBinding, boot_services::MockUefiBootServices};
@@ -276,6 +278,55 @@ mod test {
     let mut hid_factory = HidFactory::new(hid_io_factory, receiver_factory, agent);
     let controller = 0x02 as efi::Handle;
     hid_factory.driver_binding_start(boot_services, controller).unwrap();
+
+    //test note: this will leak a HidInstance.
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn driver_binding_start_should_stop_after_start () {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    let agent = 0x1 as efi::Handle;
+
+    let mut hid_io_factory = Box::new(MockHidIoFactory::new());
+    hid_io_factory.expect_new_hid_io()
+      .returning(|_|{
+        let mut hid_io = MockHidIo::new();
+        hid_io.expect_set_report_receiver().returning(|_|Ok(()));
+        Ok(Box::new(hid_io))
+      } );
+
+    let mut receiver_factory = Box::new(MockHidReceiverFactory::new());
+    receiver_factory.expect_new_hid_receiver_list()
+      .returning(|_|{
+        let mut hid_receiver = MockHidReportReciever::new();
+        hid_receiver.expect_initialize().returning(|_|Ok(()));
+        Ok(vec![Box::new(hid_receiver)])
+      });
+
+
+    static mut HID_INSTANCE_PTR: *mut c_void = core::ptr::null_mut();
+    boot_services.expect_install_protocol_interface()
+      .returning_st(|_,_,_,instance|
+        {
+          unsafe {HID_INSTANCE_PTR = instance};
+          efi::Status::SUCCESS
+        }
+      );
+
+    let mut hid_factory = HidFactory::new(hid_io_factory, receiver_factory, agent);
+    let controller = 0x02 as efi::Handle;
+    hid_factory.driver_binding_start(boot_services, controller).unwrap();
+
+    assert_ne!(unsafe {HID_INSTANCE_PTR}, core::ptr::null_mut());
+
+    hid_factory.driver_binding_stop(boot_services, controller).unwrap();
 
     //drop the faux static boot services.
     unsafe { drop(Box::from_raw(raw_boot_services)) };
