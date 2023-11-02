@@ -9,9 +9,9 @@ use crate::boot_services::UefiBootServices;
 
 #[cfg_attr(test, automock)]
 pub trait DriverBinding {
-  fn driver_binding_supported(&self, boot_services: &dyn UefiBootServices, controller: efi::Handle) -> efi::Status;
-  fn driver_binding_start(&mut self, boot_services: &dyn UefiBootServices, controller: efi::Handle) -> efi::Status;
-  fn driver_binding_stop(&mut self, boot_services: &dyn UefiBootServices, controller: efi::Handle) -> efi::Status;
+  fn driver_binding_supported(&mut self, boot_services: &'static dyn UefiBootServices, controller: efi::Handle) -> Result<(), efi::Status>;
+  fn driver_binding_start(&mut self, boot_services: &'static dyn UefiBootServices, controller: efi::Handle) -> Result<(), efi::Status>;
+  fn driver_binding_stop(&mut self, boot_services: &'static dyn UefiBootServices, controller: efi::Handle) -> Result<(), efi::Status>;
 }
 
 #[repr(C)]
@@ -74,7 +74,10 @@ impl UefiDriverBinding {
     _remaining_device_path: *mut protocols::device_path::Protocol,
   ) -> efi::Status {
     let uefi_binding = unsafe { (this as *mut UefiDriverBinding).as_mut() }.expect("bad this pointer");
-    uefi_binding.binding.driver_binding_supported(uefi_binding.boot_services, controller)
+    match uefi_binding.binding.driver_binding_supported(uefi_binding.boot_services, controller) {
+      Ok(_) => efi::Status::SUCCESS,
+      Err(err) => err
+    }
   }
   extern "efiapi" fn driver_binding_start(
     this: *mut protocols::driver_binding::Protocol,
@@ -82,7 +85,10 @@ impl UefiDriverBinding {
     _remaining_device_path: *mut protocols::device_path::Protocol,
   ) -> efi::Status {
     let uefi_binding = unsafe { (this as *mut UefiDriverBinding).as_mut() }.expect("bad this pointer");
-    uefi_binding.binding.driver_binding_start(uefi_binding.boot_services, controller)
+    match uefi_binding.binding.driver_binding_start(uefi_binding.boot_services, controller)  {
+      Ok(_) => efi::Status::SUCCESS,
+      Err(err) => err
+    }
   }
   pub extern "efiapi" fn driver_binding_stop(
     this: *mut protocols::driver_binding::Protocol,
@@ -91,7 +97,10 @@ impl UefiDriverBinding {
     _child_handle_buffer: *mut efi::Handle,
   ) -> efi::Status {
     let uefi_binding = unsafe { (this as *mut UefiDriverBinding).as_mut() }.expect("bad this pointer");
-    uefi_binding.binding.driver_binding_stop(uefi_binding.boot_services, controller)
+    match uefi_binding.binding.driver_binding_stop(uefi_binding.boot_services, controller)  {
+      Ok(_) => efi::Status::SUCCESS,
+      Err(err) => err
+    }
   }
 }
 
@@ -262,9 +271,9 @@ mod test {
     boot_services.expect_install_protocol_interface().returning(|_, _, _, _| efi::Status::SUCCESS);
 
     let mut binding = MockDriverBinding::new();
-    binding.expect_driver_binding_supported().returning(|_, _| efi::Status::SUCCESS);
-    binding.expect_driver_binding_start().returning(|_, _| efi::Status::SUCCESS);
-    binding.expect_driver_binding_stop().returning(|_, _| efi::Status::SUCCESS);
+    binding.expect_driver_binding_supported().returning(|_, _| Ok(()));
+    binding.expect_driver_binding_start().returning(|_, _| Ok(()));
+    binding.expect_driver_binding_stop().returning(|_, _| Ok(()));
 
     let handle = 0x1234 as efi::Handle;
     let driver_binding = UefiDriverBinding::new(boot_services, Box::new(binding), handle);
@@ -286,5 +295,8 @@ mod test {
       (driver_binding_ref.uefi_binding.stop)(this_ptr, controller_handle, 0, core::ptr::null_mut()),
       efi::Status::SUCCESS
     );
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+
   }
 }

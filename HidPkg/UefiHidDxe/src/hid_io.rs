@@ -1,32 +1,67 @@
-use core::ffi::c_void;
+use core::{ffi::c_void, slice::from_raw_parts_mut, any::Any};
 
+use alloc::{boxed::Box, vec};
+
+use hid_io::protocol::HidReportType;
 use hidparser::ReportDescriptor;
 use r_efi::efi;
 #[cfg(not(test))]
 use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR};
 
+#[cfg(test)]
+use mockall::automock;
+
 use crate::boot_services::UefiBootServices;
 
+#[cfg_attr(test, automock)]
 pub trait HidReportReciever {
-  fn receive_report(&mut self, report: &[u8]);
+  fn receive_report(&mut self, report: &[u8], hid_io: &dyn HidIo);
+  fn as_any(&mut self) -> &mut dyn Any;
 }
 
+#[cfg_attr(test, automock)]
 pub trait HidIo {
   fn get_report_descriptor(&self) -> Result<ReportDescriptor, efi::Status>;
-  fn get_input_report(&self, id: Option<u8>) -> Result<&[u8], efi::Status>;
-  fn set_ouput_report(&self, id: Option<u8>, report: &[u8]) -> Result<(), efi::Status>;
-  fn set_report_receiver(&self, receiver: &dyn HidReportReciever) -> Result<(), efi::Status>;
+  fn set_output_report(&self, id: Option<u8>, report: &[u8]) -> Result<(), efi::Status>;
+  fn set_report_receiver(&mut self, receiver: Box<dyn HidReportReciever>) -> Result<(), efi::Status>;
+  fn take_report_receiver(&mut self) -> Option<Box<dyn HidReportReciever>>;
 }
+
+
+#[cfg_attr(test, automock)]
+pub trait HidIoFactory {
+  fn new_hid_io(&self, controller: efi::Handle) -> Result<Box<dyn HidIo>, efi::Status>;
+ }
+
+ pub struct UefiHidIoFactory {
+  boot_services: &'static dyn UefiBootServices,
+  agent: efi::Handle
+ }
+
+impl UefiHidIoFactory {
+  pub fn new(boot_services: &'static dyn UefiBootServices, agent: efi::Handle) -> Self {
+    UefiHidIoFactory { boot_services, agent }
+  }
+}
+
+ impl HidIoFactory for UefiHidIoFactory {
+  fn new_hid_io(&self, controller: efi::Handle) -> Result<Box<dyn HidIo>, efi::Status> {
+    let hid_io = UefiHidIo::new(self.boot_services, self.agent, controller)?;
+    Ok(Box::new(hid_io))
+  }
+ }
 
 pub struct UefiHidIo {
   hid_io: &'static mut hid_io::protocol::Protocol,
   boot_services: &'static dyn UefiBootServices,
   controller: efi::Handle,
-  agent: efi::Handle
+  agent: efi::Handle,
+  receiver: Option<Box<dyn HidReportReciever>>
 }
 
 impl UefiHidIo {
-  pub fn new(boot_services: &'static dyn UefiBootServices, controller: efi::Handle, agent: efi::Handle) -> Result<Self, efi::Status> {
+  fn new(boot_services: &'static dyn UefiBootServices, agent: efi::Handle, controller: efi::Handle) -> Result<Self, efi::Status> {
+
     let mut hid_io_ptr: *mut hid_io::protocol::Protocol = core::ptr::null_mut();
 
     let status = boot_services.open_protocol(
@@ -37,28 +72,43 @@ impl UefiHidIo {
       controller,
       efi::OPEN_PROTOCOL_BY_DRIVER,
     );
+
     if status.is_error() {
       return Err(status);
     }
 
-    Ok(Self{
-      hid_io: unsafe {hid_io_ptr.as_mut().expect("bad hid_io ptr")},
-      boot_services,
-      controller,
-      agent
-    })
+    let hid_io = unsafe {hid_io_ptr.as_mut().expect("bad hid_io ptr")};
+    Ok(
+      Self {
+        hid_io,
+        boot_services,
+        controller,
+        agent,
+        receiver: None
+      }
+    )
+  }
+
+  extern "efiapi" fn report_callback(report_buffer_size: u16, report_buffer: *mut c_void, context: *mut c_void) {
+    let hid_io = unsafe {(context as *mut Self).as_mut().expect("bad context")};
+    if let Some(mut receiver) = hid_io.receiver.take() {
+      let report = unsafe {from_raw_parts_mut(report_buffer as *mut u8, report_buffer_size as usize)};
+      receiver.receive_report(report, hid_io);
+      hid_io.receiver = Some(receiver);
+    }
   }
 }
 
 impl Drop for UefiHidIo {
   fn drop(&mut self) {
+    let _ = self.take_report_receiver();
     let status = self.boot_services.close_protocol(
       self.controller,
       &hid_io::protocol::GUID as *const efi::Guid as *mut efi::Guid,
       self.agent,
       self.controller);
-    #[cfg(not(test))]
     if status.is_error() {
+      #[cfg(not(test))]
       debugln!(DEBUG_ERROR, "Unexpected error closing hid_io: {:x?}", status);
     }
   }
@@ -66,6 +116,7 @@ impl Drop for UefiHidIo {
 
 impl HidIo for UefiHidIo {
   fn get_report_descriptor(&self) -> Result<ReportDescriptor, efi::Status> {
+
     let mut report_descriptor_size: usize = 0;
     match (self.hid_io.get_report_descriptor)(
       self.hid_io,
@@ -91,23 +142,52 @@ impl HidIo for UefiHidIo {
 
     hidparser::parse_report_descriptor(&report_descriptor_buffer)
       .map_err(|_|efi::Status::DEVICE_ERROR)
+
   }
-  fn get_input_report(&self, id: Option<u8>) -> Result<&[u8], efi::Status> {
-    todo!()
+
+  fn set_output_report(&self, id: Option<u8>, report: &[u8]) -> Result<(), efi::Status> {
+    match (self.hid_io.set_report)(
+      self.hid_io,
+      id.unwrap_or(0),
+      HidReportType::OutputReport,
+      report.len(),
+      report.as_ptr() as *mut c_void)
+    {
+      efi::Status::SUCCESS => Ok(()),
+      err => Err(err)
+    }
   }
-  fn set_ouput_report(&self, id: Option<u8>, report: &[u8]) -> Result<(), efi::Status> {
-    todo!()
+
+  fn set_report_receiver(&mut self, receiver: Box<dyn HidReportReciever>) -> Result<(), efi::Status> {
+    let self_ptr = self as *mut UefiHidIo;
+
+    //always attempt uninstall. Failure is ok if not already installed. This shuts down report callback generation
+    //(if any) so that callbacks are not occuring while the new receiver is installed.
+    let _ = (self.hid_io.unregister_report_callback)(self.hid_io, Self::report_callback);
+
+    match (self.hid_io.register_report_callback)(self.hid_io, Self::report_callback, self_ptr as *mut c_void) {
+      efi::Status::SUCCESS => (),
+      err => {
+        return Err(err)
+      }
+    }
+    self.receiver = Some(receiver);
+
+    Ok(())
   }
-  fn set_report_receiver(&self, receiver: &dyn HidReportReciever) -> Result<(), efi::Status> {
-    todo!()
+  fn take_report_receiver(&mut self) -> Option<Box<dyn HidReportReciever>> {
+    //always attempt uninstall. Failure is ok if not already installed. This shuts down report callback generation
+    //(if any) so that callbacks are not occuring before the receiver is removed.
+    let _ = (self.hid_io.unregister_report_callback)(self.hid_io, Self::report_callback);
+    self.receiver.take()
   }
 }
 
 #[cfg(test)]
 mod test {
-  use core::{ffi::c_void, slice::from_raw_parts_mut};
+  use core::{ffi::c_void, slice::{from_raw_parts_mut, from_raw_parts}};
 
-  use super::{UefiHidIo, HidIo};
+  use super::{UefiHidIo, HidIo, MockHidReportReciever};
 
   use crate::boot_services::MockUefiBootServices;
 
@@ -128,13 +208,17 @@ mod test {
     0xc0, // END_COLLECTION
   ];
 
-  fn mock_hid_io() -> hid_io::protocol::Protocol {
+  static TEST_REPORT0: &[u8] = &[0x0, 0x1, 0x2, 0x3, 0x4];
+  static TEST_REPORT1: &[u8] = &[0x4, 0x3, 0x2, 0x1, 0x0];
 
+  // Mock the HidIo FFI interface.
+  fn mock_hid_io() -> hid_io::protocol::Protocol {
     extern "efiapi" fn mock_get_report_descriptor (
-      _this: *const hid_io::protocol::Protocol,
+      this: *const hid_io::protocol::Protocol,
       report_descriptor_size: *mut usize,
       report_descriptor_buffer: *mut c_void,
     ) -> efi::Status {
+      assert_ne!(this, core::ptr::null());
       unsafe {
         if *report_descriptor_size < MINIMAL_BOOT_KEYBOARD_REPORT_DESCRIPTOR.len() {
           *report_descriptor_size = MINIMAL_BOOT_KEYBOARD_REPORT_DESCRIPTOR.len();
@@ -147,6 +231,7 @@ mod test {
         }
       }
     }
+
     extern "efiapi" fn mock_get_report (
       _this: *const hid_io::protocol::Protocol,
       _report_id: u8,
@@ -154,29 +239,51 @@ mod test {
       _report_buffer_size: usize,
       _report_buffer: *mut c_void,
     ) -> efi::Status {
-      efi::Status::UNSUPPORTED
+      panic!("This impementation does not use get_report.");
     }
+
     extern "efiapi" fn mock_set_report (
-      _this: *const hid_io::protocol::Protocol,
-      _report_id: u8,
-      _report_type: hid_io::protocol::HidReportType,
-      _report_buffer_size: usize,
-      _report_buffer: *mut c_void,
+      this: *const hid_io::protocol::Protocol,
+      report_id: u8,
+      report_type: hid_io::protocol::HidReportType,
+      report_buffer_size: usize,
+      report_buffer: *mut c_void,
     ) -> efi::Status {
-      efi::Status::UNSUPPORTED
+      assert_ne!(this, core::ptr::null());
+      assert_eq!(report_type, hid_io::protocol::HidReportType::OutputReport);
+      assert_ne!(report_buffer_size, 0);
+      assert_ne!(report_buffer, core::ptr::null_mut());
+
+      let report_slice = unsafe {from_raw_parts(report_buffer as *mut u8, report_buffer_size)};
+
+      match report_id {
+        0 => {assert_eq!(report_slice, TEST_REPORT0); efi::Status::SUCCESS},
+        1 => {assert_eq!(report_slice, TEST_REPORT1); efi::Status::SUCCESS},
+        _ => efi::Status::UNSUPPORTED
+      }
     }
+
     extern "efiapi" fn mock_register_report_callback(
-      _this: *const hid_io::protocol::Protocol,
-      _callback: hid_io::protocol::HidIoReportCallback,
-      _context: *mut c_void
+      this: *const hid_io::protocol::Protocol,
+      callback: hid_io::protocol::HidIoReportCallback,
+      context: *mut c_void
     ) -> efi::Status {
-      efi::Status::UNSUPPORTED
+      assert_ne!(this, core::ptr::null());
+      assert_ne!(context, core::ptr::null_mut());
+      assert!(callback == UefiHidIo::report_callback);
+
+      callback(TEST_REPORT0.len() as u16, TEST_REPORT0.as_ptr() as *mut c_void, context);
+
+      efi::Status::SUCCESS
     }
+
     extern "efiapi" fn mock_unregister_report_callback(
-      _this: *const hid_io::protocol::Protocol,
-      _callback: hid_io::protocol::HidIoReportCallback
+      this: *const hid_io::protocol::Protocol,
+      callback: hid_io::protocol::HidIoReportCallback
     ) -> efi::Status {
-      efi::Status::UNSUPPORTED
+      assert_ne!(this, core::ptr::null());
+      assert!(callback == UefiHidIo::report_callback);
+      efi::Status::SUCCESS
     }
 
     hid_io::protocol::Protocol {
@@ -207,7 +314,9 @@ mod test {
           assert_eq!(controller, 0x1234 as efi::Handle);
           assert_eq!(attributes, efi::OPEN_PROTOCOL_BY_DRIVER);
 
-          unsafe {*interface = 0x1234 as *mut c_void};
+          //note: this leaks; but easier than trying to share it between the closure and the environment.
+          let hid_io = Box::into_raw(Box::new(mock_hid_io()));
+          unsafe {*interface = hid_io as *mut c_void};
           efi::Status::SUCCESS
         });
 
@@ -221,7 +330,7 @@ mod test {
           efi::Status::SUCCESS
         });
 
-    let uefi_hid_io = UefiHidIo::new(boot_services, controller, agent).unwrap();
+    let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller).unwrap();
     drop(uefi_hid_io);
 
     //drop the faux static boot services.
@@ -241,19 +350,99 @@ mod test {
       .returning(|_, _, interface, _, _, _|
         {
           let hid_io = mock_hid_io();
+          //note: this leaks; but easier than trying to share it between the closure and the environment.
           unsafe {*interface = Box::into_raw(Box::new(hid_io)) as *mut c_void};
           efi::Status::SUCCESS
         });
 
     boot_services.expect_close_protocol()
-      .returning(|handle, protocol, agent, controller|
+      .returning(|_, _, _, _|
         {
           efi::Status::SUCCESS
         });
 
-    let uefi_hid_io = UefiHidIo::new(boot_services, controller, agent).unwrap();
-    let _descriptor = uefi_hid_io.get_report_descriptor().unwrap();
+    let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller).unwrap();
+    let descriptor = uefi_hid_io.get_report_descriptor().unwrap();
+    assert_eq!(descriptor, hidparser::parse_report_descriptor(&MINIMAL_BOOT_KEYBOARD_REPORT_DESCRIPTOR).unwrap());
+    drop(uefi_hid_io);
 
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
   }
 
+  #[test]
+  fn set_report_should_set_report() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+    let controller: efi::Handle = 0x1234 as efi::Handle;
+    let agent: efi::Handle = 0x4321 as efi::Handle;
+
+    boot_services.expect_open_protocol()
+      .returning(|_, _, interface, _, _, _|
+        {
+          let hid_io = mock_hid_io();
+          unsafe {*interface = Box::into_raw(Box::new(hid_io)) as *mut c_void};
+          efi::Status::SUCCESS
+        });
+
+    boot_services.expect_close_protocol()
+      .returning(|_, _, _, _|
+        {
+          efi::Status::SUCCESS
+        });
+
+    let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller).unwrap();
+
+    uefi_hid_io.set_output_report(None, &TEST_REPORT0).unwrap();
+    uefi_hid_io.set_output_report(Some(1), &TEST_REPORT1).unwrap();
+    assert_eq!(uefi_hid_io.set_output_report(Some(2), &TEST_REPORT0), Err(efi::Status::UNSUPPORTED));
+
+    drop(uefi_hid_io);
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn set_reciever_should_install_receiver() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+    let controller: efi::Handle = 0x1234 as efi::Handle;
+    let agent: efi::Handle = 0x4321 as efi::Handle;
+
+    boot_services.expect_open_protocol()
+      .returning(|_, _, interface, _, _, _|
+        {
+          let hid_io = mock_hid_io();
+          unsafe {*interface = Box::into_raw(Box::new(hid_io)) as *mut c_void};
+          efi::Status::SUCCESS
+        });
+
+    boot_services.expect_close_protocol()
+      .returning(|_, _, _, _|
+        {
+          efi::Status::SUCCESS
+        });
+
+    let mut uefi_hid_io = UefiHidIo::new(boot_services, agent, controller).unwrap();
+
+    let mut mock_receiver = MockHidReportReciever::new();
+    mock_receiver.expect_receive_report()
+      .withf(|report, _|{
+        assert_eq!(report, TEST_REPORT0);
+        true
+      })
+      .returning(|_, _|());
+
+    uefi_hid_io.set_report_receiver(Box::new(mock_receiver)).unwrap();
+
+    drop(uefi_hid_io);
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
 }

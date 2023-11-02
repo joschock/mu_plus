@@ -6,6 +6,7 @@ pub mod boot_services;
 pub mod driver_binding;
 pub mod hid;
 pub mod hid_io;
+pub mod pointer;
 
 use boot_services::StandardUefiBootServices;
 use r_efi::efi;
