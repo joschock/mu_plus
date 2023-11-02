@@ -8,6 +8,10 @@ use r_efi::efi;
 #[cfg(not(test))]
 use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR};
 
+#[cfg(test)]
+use mockall::automock;
+
+#[cfg_attr(test, automock)]
 pub trait HidReceiverFactory {
   fn new_hid_receiver_list(&self, controller: efi::Handle) -> Result<Vec<Box<dyn HidReportReciever>>, efi::Status>;
 }
@@ -57,9 +61,19 @@ impl DriverBinding for HidFactory {
   {
     let mut hid_io = self.hid_io_factory.new_hid_io(controller)?;
 
-    let hid_splitter = Box::new(HidSplitter {
-      receivers: self.receiver_factory.new_hid_receiver_list(controller)?
+    let mut hid_splitter = Box::new(HidSplitter {
+      receivers: Vec::new()
     });
+
+    for mut receiver in self.receiver_factory.new_hid_receiver_list(controller)? {
+      if receiver.initialize(hid_io.as_mut()).is_ok(){
+        hid_splitter.receivers.push(receiver);
+      }
+    }
+
+    if hid_splitter.receivers.len() == 0 {
+      return Err(efi::Status::UNSUPPORTED);
+    }
 
     hid_io.set_report_receiver(hid_splitter)?;
 
@@ -126,6 +140,9 @@ struct HidSplitter {
 }
 
 impl HidReportReciever for HidSplitter {
+  fn initialize(&mut self, _hid_io: &dyn HidIo) -> Result<(),efi::Status> {
+      panic!("initialize not expected for HidSplitter")
+  }
   fn as_any(&mut self) ->  &mut dyn Any {
       self
   }
@@ -133,5 +150,134 @@ impl HidReportReciever for HidSplitter {
     for receiver in &mut self.receivers {
       receiver.receive_report(report, hid_io)
     }
+  }
+}
+
+#[cfg(test)]
+mod test {
+    use r_efi::efi;
+
+    use crate::{hid_io::{MockHidIoFactory, MockHidIo, MockHidReportReciever}, driver_binding::DriverBinding, boot_services::MockUefiBootServices};
+
+    use super::{MockHidReceiverFactory, HidFactory};
+
+
+  #[test]
+  fn driver_binding_supported_should_indicate_support() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_ref().unwrap() };
+
+    let mut hid_io_factory = Box::new(MockHidIoFactory::new());
+    //handle 0x3 should return success.
+    hid_io_factory.expect_new_hid_io().withf_st(|controller|{*controller == 0x3 as efi::Handle}).returning(|_| Ok(Box::new(MockHidIo::new())));
+    //default for any other handles
+    hid_io_factory.expect_new_hid_io().returning(|_| Err(efi::Status::UNSUPPORTED));
+
+    let receiver_factory = Box::new(MockHidReceiverFactory::new());
+    let agent = 0x1 as efi::Handle;
+    let mut hid_factory = HidFactory::new(hid_io_factory, receiver_factory, agent);
+
+    let controller = 0x2 as efi::Handle;
+    assert_eq!(hid_factory.driver_binding_supported(boot_services, controller), Err(efi::Status::UNSUPPORTED));
+
+    let controller = 0x3 as efi::Handle;
+    assert!(hid_factory.driver_binding_supported(boot_services, controller).is_ok());
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn driver_binding_start_should_not_start_when_not_supported() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_ref().unwrap() };
+    let mut hid_io_factory = Box::new(MockHidIoFactory::new());
+    hid_io_factory.expect_new_hid_io().withf_st(|controller|{*controller == 0x3 as efi::Handle}).returning(|_| Ok(Box::new(MockHidIo::new())));
+    hid_io_factory.expect_new_hid_io().withf_st(|controller|{*controller == 0x4 as efi::Handle}).returning(|_| Ok(Box::new(MockHidIo::new())));
+    //default for any other handles
+    hid_io_factory.expect_new_hid_io().returning(|_| Err(efi::Status::UNSUPPORTED));
+
+    let mut receiver_factory = Box::new(MockHidReceiverFactory::new());
+    receiver_factory.expect_new_hid_receiver_list().withf_st(|controller|{*controller == 0x4 as efi::Handle}).returning(|_| Ok(Vec::new()));
+    receiver_factory.expect_new_hid_receiver_list().returning(|_|Err(efi::Status::UNSUPPORTED));
+
+    let agent = 0x1 as efi::Handle;
+    let mut hid_factory = HidFactory::new(hid_io_factory, receiver_factory, agent);
+
+    // test: no hid_io on the handle.
+    let controller = 0x02 as efi::Handle;
+    assert_eq!(hid_factory.driver_binding_start(boot_services, controller), Err(efi::Status::UNSUPPORTED));
+
+    // test: hid_io present, but failed to retrive receivers.
+    let controller = 0x03 as efi::Handle;
+    assert_eq!(hid_factory.driver_binding_start(boot_services, controller), Err(efi::Status::UNSUPPORTED));
+
+    // test: hid_io present, empty receiver list.
+    let controller = 0x04 as efi::Handle;
+    assert_eq!(hid_factory.driver_binding_start(boot_services, controller), Err(efi::Status::UNSUPPORTED));
+
+    let boot_services = unsafe {raw_boot_services.as_mut().unwrap()};
+    boot_services.checkpoint();
+
+    //test: hid_io present, receiver present, receiver init indicates no support.
+    let mut hid_io_factory = Box::new(MockHidIoFactory::new());
+    hid_io_factory.expect_new_hid_io().returning(|_| Ok(Box::new(MockHidIo::new())));
+
+    let mut receiver_factory = Box::new(MockHidReceiverFactory::new());
+    receiver_factory.expect_new_hid_receiver_list()
+      .returning(|_|{
+        let mut hid_receiver = MockHidReportReciever::new();
+        hid_receiver.expect_initialize().returning(|_|Err(efi::Status::UNSUPPORTED));
+        Ok(vec![Box::new(hid_receiver)])
+      });
+
+    let mut hid_factory = HidFactory::new(hid_io_factory, receiver_factory, agent);
+    let controller = 0x02 as efi::Handle;
+    assert_eq!(hid_factory.driver_binding_start(boot_services, controller), Err(efi::Status::UNSUPPORTED));
+
+    let boot_services = unsafe {raw_boot_services.as_mut().unwrap()};
+    boot_services.checkpoint();
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn driver_binding_start_should_start_when_supported () {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    let agent = 0x1 as efi::Handle;
+
+    let mut hid_io_factory = Box::new(MockHidIoFactory::new());
+    hid_io_factory.expect_new_hid_io()
+      .returning(|_|{
+        let mut hid_io = MockHidIo::new();
+        hid_io.expect_set_report_receiver().returning(|_|Ok(()));
+        Ok(Box::new(hid_io))
+      } );
+
+    let mut receiver_factory = Box::new(MockHidReceiverFactory::new());
+    receiver_factory.expect_new_hid_receiver_list()
+      .returning(|_|{
+        let mut hid_receiver = MockHidReportReciever::new();
+        hid_receiver.expect_initialize().returning(|_|Ok(()));
+        Ok(vec![Box::new(hid_receiver)])
+      });
+
+    boot_services.expect_install_protocol_interface().returning(|_,_,_,_|efi::Status::SUCCESS);
+
+    let mut hid_factory = HidFactory::new(hid_io_factory, receiver_factory, agent);
+    let controller = 0x02 as efi::Handle;
+    hid_factory.driver_binding_start(boot_services, controller).unwrap();
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
   }
 }

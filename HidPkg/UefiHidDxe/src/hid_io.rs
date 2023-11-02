@@ -15,6 +15,7 @@ use crate::boot_services::UefiBootServices;
 
 #[cfg_attr(test, automock)]
 pub trait HidReportReciever {
+  fn initialize(&mut self, hid_io: &dyn HidIo) -> Result<(), efi::Status>;
   fn receive_report(&mut self, report: &[u8], hid_io: &dyn HidIo);
   fn as_any(&mut self) -> &mut dyn Any;
 }
