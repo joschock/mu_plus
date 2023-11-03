@@ -320,6 +320,17 @@ mod test {
         }
       );
 
+    boot_services.expect_open_protocol()
+      .returning_st(|_,_,interface,_,_,_|
+        {
+          unsafe {*interface = HID_INSTANCE_PTR};
+          efi::Status::SUCCESS
+        }
+      );
+
+    boot_services.expect_uninstall_protocol_interface()
+      .returning(|_,_,_|efi::Status::SUCCESS);
+
     let mut hid_factory = HidFactory::new(hid_io_factory, receiver_factory, agent);
     let controller = 0x02 as efi::Handle;
     hid_factory.driver_binding_start(boot_services, controller).unwrap();
