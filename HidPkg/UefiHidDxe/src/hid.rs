@@ -1,4 +1,4 @@
-use core::{any::Any, ffi::c_void};
+use core::ffi::c_void;
 
 use crate::{
   boot_services::UefiBootServices,
@@ -143,9 +143,6 @@ struct HidSplitter {
 impl HidReportReciever for HidSplitter {
   fn initialize(&mut self, _controller: efi::Handle, _hid_io: &dyn HidIo) -> Result<(), efi::Status> {
     panic!("initialize not expected for HidSplitter")
-  }
-  fn as_any(&mut self) -> &mut dyn Any {
-    self
   }
   fn receive_report(&mut self, report: &[u8], hid_io: &dyn HidIo) {
     for receiver in &mut self.receivers {

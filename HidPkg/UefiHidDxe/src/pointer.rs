@@ -1,4 +1,4 @@
-use core::{any::Any, ffi::c_void};
+use core::ffi::c_void;
 
 use alloc::{
   boxed::Box,
@@ -375,10 +375,6 @@ impl HidReportReciever for PointerHidHandler {
     }
 
     self.boot_services.restore_tpl(old_tpl);
-  }
-
-  fn as_any(&mut self) -> &mut dyn Any {
-    self
   }
 }
 

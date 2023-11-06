@@ -1,4 +1,4 @@
-use core::{any::Any, ffi::c_void, slice::from_raw_parts_mut};
+use core::{ffi::c_void, slice::from_raw_parts_mut};
 
 use alloc::{boxed::Box, vec};
 
@@ -17,7 +17,6 @@ use crate::boot_services::UefiBootServices;
 pub trait HidReportReciever {
   fn initialize(&mut self, controller: efi::Handle, hid_io: &dyn HidIo) -> Result<(), efi::Status>;
   fn receive_report(&mut self, report: &[u8], hid_io: &dyn HidIo);
-  fn as_any(&mut self) -> &mut dyn Any;
 }
 
 #[cfg_attr(test, automock)]
