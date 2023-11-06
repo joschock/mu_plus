@@ -185,24 +185,30 @@ impl PointerHidHandler {
   // handles x_axis inputs
   fn x_axis_handler(&mut self, field: VariableField, report: &[u8]) {
     if let Some(x_value) = Self::resolve_axis(self.current_state.current_x, field, report) {
-      self.current_state.current_x = x_value;
-      self.state_changed = true;
+      if self.current_state.current_x != x_value {
+        self.current_state.current_x = x_value;
+        self.state_changed = true;
+      }
     }
   }
 
   // handles y_axis inputs
   fn y_axis_handler(&mut self, field: VariableField, report: &[u8]) {
     if let Some(y_value) = Self::resolve_axis(self.current_state.current_y, field, report) {
-      self.current_state.current_y = y_value;
-      self.state_changed = true;
+      if self.current_state.current_y != y_value {
+        self.current_state.current_y = y_value;
+        self.state_changed = true;
+      }
     }
   }
 
   // handles z_axis inputs
   fn z_axis_handler(&mut self, field: VariableField, report: &[u8]) {
     if let Some(z_value) = Self::resolve_axis(self.current_state.current_z, field, report) {
-      self.current_state.current_z = z_value;
-      self.state_changed = true;
+      if self.current_state.current_z != z_value {
+        self.current_state.current_z = z_value;
+        self.state_changed = true;
+      }
     }
   }
 
@@ -222,11 +228,14 @@ impl PointerHidHandler {
       }
       let button_value = button_value << shift;
 
-      self.current_state.active_buttons = self.current_state.active_buttons
+      let new_buttons = self.current_state.active_buttons
         & !(1 << shift)  // zero the relevant bit in the button state field.
         | button_value; // or in the current button state into that bit position.
 
-      self.state_changed = true;
+      if new_buttons != self.current_state.active_buttons {
+        self.current_state.active_buttons = new_buttons;
+        self.state_changed = true;
+      }
     }
   }
 
@@ -593,6 +602,36 @@ mod test {
     0xc0, // END_COLLECTION
   ];
 
+  static ABS_POINTER_REPORT_DESCRIPTOR: &[u8] = &[
+    0x05, 0x01, // USAGE_PAGE (Generic Desktop)
+    0x09, 0x02, // USAGE (Mouse)
+    0xa1, 0x01, // COLLECTION (Application)
+    0x09, 0x01, //   USAGE(Pointer)
+    0xa1, 0x00, //   COLLECTION (Physical)
+    0x05, 0x09, //     USAGE_PAGE (Button)
+    0x19, 0x01, //     USAGE_MINIMUM(1)
+    0x29, 0x05, //     USAGE_MAXIMUM(5)
+    0x15, 0x00, //     LOGICAL_MINIMUM(0)
+    0x25, 0x01, //     LOGICAL_MAXIMUM(1)
+    0x95, 0x05, //     REPORT_COUNT(5)
+    0x75, 0x01, //     REPORT_SIZE(1)
+    0x81, 0x02, //     INPUT(Data, Variable, Absolute)
+    0x95, 0x01, //     REPORT_COUNT(1)
+    0x75, 0x03, //     REPORT_SIZE(3)
+    0x81, 0x01, //     INPUT(Constant, Array, Absolute)
+    0x05, 0x01, //     USAGE_PAGE (Generic Desktop)
+    0x09, 0x30, //     USAGE (X)
+    0x09, 0x31, //     USAGE (Y)
+    0x09, 0x38, //     USAGE (Wheel)
+    0x15, 0x00, //     LOGICAL_MINIMUM (0)
+    0x26, 0xff, 0x0f, // LOGICAL_MAXIMUM (4095)
+    0x75, 0x10, //     REPORT_SIZE (16)
+    0x95, 0x03, //     REPORT_COUNT (3)
+    0x81, 0x02, //     INPUT(Data, Variable, Absolute)
+    0xc0, //   END_COLLECTION
+    0xc0, // END_COLLECTION
+  ];
+
   #[test]
   fn pointer_initialize_should_fail_if_report_descriptor_not_supported() {
     // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
@@ -657,7 +696,7 @@ mod test {
   }
 
   #[test]
-  fn receive_report_should_process_report() {
+  fn receive_report_should_process_relative_reports() {
     // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
     // to emulate this without actually creating a static, use a raw pointer.
     let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
@@ -760,6 +799,164 @@ mod test {
     //drop the faux static boot services.
     unsafe { drop(Box::from_raw(raw_boot_services)) };
   }
+
+  #[test]
+  fn receive_report_should_process_absolute_reports() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    {
+      static mut ABS_PTR_INTERFACE: *mut c_void = core::ptr::null_mut();
+
+      // expected on PointerHidHandler::initialize().
+      boot_services.expect_create_event().returning(|_, _, _, _, _| efi::Status::SUCCESS);
+      boot_services.expect_install_protocol_interface().returning(|_, _, _, interface| {
+        unsafe { ABS_PTR_INTERFACE = interface };
+        efi::Status::SUCCESS
+      });
+
+      // expected on PointerHidHandler::drop().
+      boot_services.expect_open_protocol().returning(|_, _, interface, _, _, _| {
+        unsafe { *interface = ABS_PTR_INTERFACE };
+        efi::Status::SUCCESS
+      });
+      boot_services.expect_uninstall_protocol_interface().returning(|_, _, _| efi::Status::SUCCESS);
+      boot_services.expect_close_event().returning(|_| efi::Status::SUCCESS);
+
+      // expected on PointerHidHandler::receive_report
+      boot_services.expect_raise_tpl().returning(|new_tpl| {
+        assert_eq!(new_tpl, efi::TPL_NOTIFY);
+        efi::TPL_APPLICATION
+      });
+
+      boot_services.expect_restore_tpl().returning(|new_tpl| {
+        assert_eq!(new_tpl, efi::TPL_APPLICATION);
+        ()
+      });
+
+      let agent = 0x1 as efi::Handle;
+      let mut pointer_handler = PointerHidHandler::new(boot_services, agent);
+      let mut hid_io = MockHidIo::new();
+      hid_io
+        .expect_get_report_descriptor()
+        .returning(|| Ok(hidparser::parse_report_descriptor(&ABS_POINTER_REPORT_DESCRIPTOR).unwrap()));
+
+      let controller = 0x2 as efi::Handle;
+      assert_eq!(pointer_handler.initialize(controller, &hid_io), Ok(()));
+
+      assert_eq!(pointer_handler.current_state.active_buttons, 0);
+      assert_eq!(pointer_handler.current_state.current_x, CENTER);
+      assert_eq!(pointer_handler.current_state.current_y, CENTER);
+      assert_eq!(pointer_handler.current_state.current_z, 0);
+      assert_eq!(pointer_handler.state_changed, false);
+
+      //click two buttons and move the cursor (1024, 1024).
+      let report: &[u8] = &[0x05, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00];
+      pointer_handler.receive_report(report, &hid_io);
+
+      assert_eq!(pointer_handler.current_state.active_buttons, 0x05);
+      // input x from range 0-4095 projected on to 0-1024 axis is (x/4095) * 1024. For x=1024, result is 256.
+      assert_eq!(pointer_handler.current_state.current_x, 256);
+      assert_eq!(pointer_handler.current_state.current_y, 256);
+      assert_eq!(pointer_handler.current_state.current_z, 0);
+      assert_eq!(pointer_handler.state_changed, true);
+
+    }
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn bad_reports_should_be_dropped() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    {
+      static mut ABS_PTR_INTERFACE: *mut c_void = core::ptr::null_mut();
+
+      // expected on PointerHidHandler::initialize().
+      boot_services.expect_create_event().returning(|_, _, _, _, _| efi::Status::SUCCESS);
+      boot_services.expect_install_protocol_interface().returning(|_, _, _, interface| {
+        unsafe { ABS_PTR_INTERFACE = interface };
+        efi::Status::SUCCESS
+      });
+
+      // expected on PointerHidHandler::drop().
+      boot_services.expect_open_protocol().returning(|_, _, interface, _, _, _| {
+        unsafe { *interface = ABS_PTR_INTERFACE };
+        efi::Status::SUCCESS
+      });
+      boot_services.expect_uninstall_protocol_interface().returning(|_, _, _| efi::Status::SUCCESS);
+      boot_services.expect_close_event().returning(|_| efi::Status::SUCCESS);
+
+      // expected on PointerHidHandler::receive_report
+      boot_services.expect_raise_tpl().returning(|new_tpl| {
+        assert_eq!(new_tpl, efi::TPL_NOTIFY);
+        efi::TPL_APPLICATION
+      });
+
+      boot_services.expect_restore_tpl().returning(|new_tpl| {
+        assert_eq!(new_tpl, efi::TPL_APPLICATION);
+        ()
+      });
+
+      let agent = 0x1 as efi::Handle;
+      let mut pointer_handler = PointerHidHandler::new(boot_services, agent);
+      let mut hid_io = MockHidIo::new();
+      hid_io
+        .expect_get_report_descriptor()
+        .returning(|| Ok(hidparser::parse_report_descriptor(&ABS_POINTER_REPORT_DESCRIPTOR).unwrap()));
+
+      let controller = 0x2 as efi::Handle;
+      assert_eq!(pointer_handler.initialize(controller, &hid_io), Ok(()));
+
+      assert_eq!(pointer_handler.current_state.active_buttons, 0);
+      assert_eq!(pointer_handler.current_state.current_x, CENTER);
+      assert_eq!(pointer_handler.current_state.current_y, CENTER);
+      assert_eq!(pointer_handler.current_state.current_z, 0);
+      assert_eq!(pointer_handler.state_changed, false);
+
+      //move the cursor (4096, 4096, 0) - changed fields are out of range
+      let report: &[u8] = &[0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00];
+      pointer_handler.receive_report(report, &hid_io);
+
+      assert_eq!(pointer_handler.current_state.active_buttons, 0);
+      assert_eq!(pointer_handler.current_state.current_x, CENTER);
+      assert_eq!(pointer_handler.current_state.current_y, CENTER);
+      assert_eq!(pointer_handler.current_state.current_z, 0);
+      assert_eq!(pointer_handler.state_changed, false);
+
+      //report too long
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x10];
+      pointer_handler.receive_report(report, &hid_io);
+
+      assert_eq!(pointer_handler.current_state.active_buttons, 0);
+      assert_eq!(pointer_handler.current_state.current_x, CENTER);
+      assert_eq!(pointer_handler.current_state.current_y, CENTER);
+      assert_eq!(pointer_handler.current_state.current_z, 0);
+      assert_eq!(pointer_handler.state_changed, false);
+
+      //report too short
+      let report: &[u8] = &[0x00, 0x10, 0x00, 0x10, 0x00, 0x10];
+      pointer_handler.receive_report(report, &hid_io);
+
+      assert_eq!(pointer_handler.current_state.active_buttons, 0);
+      assert_eq!(pointer_handler.current_state.current_x, CENTER);
+      assert_eq!(pointer_handler.current_state.current_y, CENTER);
+      assert_eq!(pointer_handler.current_state.current_z, 0);
+      assert_eq!(pointer_handler.state_changed, false);
+    }
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+
 
   #[test]
   fn wait_for_event_should_wait_for_event() {
