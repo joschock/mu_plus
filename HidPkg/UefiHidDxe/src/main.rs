@@ -17,13 +17,32 @@ mod uefi_entry {
   extern crate alloc;
   use core::panic::PanicInfo;
 
-  use alloc::boxed::Box;
+  use alloc::{boxed::Box, vec::Vec};
 
   use r_efi::{efi, system};
 
   use rust_advanced_logger_dxe::{debugln, init_debug, DEBUG_ERROR};
   use rust_boot_services_allocator_dxe::GLOBAL_ALLOCATOR;
-  use uefi_hid_dxe::{driver_binding::UefiDriverBinding, BOOT_SERVICES, RUNTIME_SERVICES, hid::{DefaultReceiverFactory, HidFactory}, hid_io::UefiHidIoFactory};
+  use uefi_hid_dxe::{
+    boot_services::UefiBootServices,
+    driver_binding::UefiDriverBinding,
+    hid::{HidFactory, HidReceiverFactory},
+    hid_io::{HidReportReciever, UefiHidIoFactory},
+    pointer::PointerHidHandler,
+    BOOT_SERVICES, RUNTIME_SERVICES,
+  };
+
+  struct UefiReceivers {
+    boot_services: &'static dyn UefiBootServices,
+    agent: efi::Handle,
+  }
+  impl HidReceiverFactory for UefiReceivers {
+    fn new_hid_receiver_list(&self, _controller: efi::Handle) -> Result<Vec<Box<dyn HidReportReciever>>, efi::Status> {
+      let mut receivers: Vec<Box<dyn HidReportReciever>> = Vec::new();
+      receivers.push(Box::new(PointerHidHandler::new(self.boot_services, self.agent)));
+      Ok(receivers)
+    }
+  }
 
   #[no_mangle]
   pub extern "efiapi" fn efi_main(image_handle: efi::Handle, system_table: *const system::SystemTable) -> efi::Status {
@@ -36,9 +55,8 @@ mod uefi_entry {
       init_debug((*system_table).boot_services);
     }
 
-
     let hid_io_factory = Box::new(UefiHidIoFactory::new(&BOOT_SERVICES, image_handle));
-    let receiver_factory = Box::new(DefaultReceiverFactory{});
+    let receiver_factory = Box::new(UefiReceivers { boot_services: &BOOT_SERVICES, agent: image_handle });
     let hid_factory = Box::new(HidFactory::new(hid_io_factory, receiver_factory, image_handle));
 
     let hid_binding = UefiDriverBinding::new(&BOOT_SERVICES, hid_factory, image_handle);
