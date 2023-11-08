@@ -6,6 +6,8 @@ pub mod boot_services;
 pub mod driver_binding;
 pub mod hid;
 pub mod hid_io;
+pub mod key_queue;
+pub mod keyboard;
 pub mod pointer;
 
 use boot_services::StandardUefiBootServices;

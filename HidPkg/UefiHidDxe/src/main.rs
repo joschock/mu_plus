@@ -28,6 +28,7 @@ mod uefi_entry {
     driver_binding::UefiDriverBinding,
     hid::{HidFactory, HidReceiverFactory},
     hid_io::{HidReportReciever, UefiHidIoFactory},
+    keyboard::KeyboardHidHandler,
     pointer::PointerHidHandler,
     BOOT_SERVICES, RUNTIME_SERVICES,
   };
@@ -40,6 +41,7 @@ mod uefi_entry {
     fn new_hid_receiver_list(&self, _controller: efi::Handle) -> Result<Vec<Box<dyn HidReportReciever>>, efi::Status> {
       let mut receivers: Vec<Box<dyn HidReportReciever>> = Vec::new();
       receivers.push(Box::new(PointerHidHandler::new(self.boot_services, self.agent)));
+      receivers.push(Box::new(KeyboardHidHandler::new(self.boot_services, self.agent)));
       Ok(receivers)
     }
   }

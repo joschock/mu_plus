@@ -267,10 +267,12 @@ impl PointerHidHandler {
       absolute_pointer_ptr as *mut c_void,
       core::ptr::addr_of_mut!(wait_for_pointer_input_event),
     );
-    if status != efi::Status::SUCCESS {
+    if status.is_error() {
       drop(unsafe { Box::from_raw(absolute_pointer_ptr) });
       return Err(status);
     }
+
+    unsafe { (*absolute_pointer_ptr).absolute_pointer.wait_for_input = wait_for_pointer_input_event };
 
     // install the absolute_pointer protocol.
     let mut controller = controller;
@@ -281,7 +283,7 @@ impl PointerHidHandler {
       absolute_pointer_ptr as *mut c_void,
     );
 
-    if status != efi::Status::SUCCESS {
+    if status.is_error() {
       let _ = self.boot_services.close_event(wait_for_pointer_input_event);
       drop(unsafe { Box::from_raw(absolute_pointer_ptr) });
       return Err(status);
@@ -432,7 +434,7 @@ impl Drop for PointerHidHandler {
       let wait_for_input_event: efi::Handle = unsafe { (*absolute_pointer_ptr).absolute_pointer.wait_for_input };
       let status = self.boot_services.close_event(wait_for_input_event);
       if status.is_error() {
-        //An error hear means the event was not uninstalled, so in theory the notification_callback on it could still be
+        //An error here means the event was not uninstalled, so in theory the notification_callback on it could still be
         //fired.
         //Mark the instance invalid by setting the pointer_handler raw pointer to null, but leak the PointerContext
         //instance. Leaking context allows calls through the pointers on absolute_pointer_ptr to continue to resolve
@@ -551,7 +553,9 @@ mod test {
   use crate::{
     boot_services::MockUefiBootServices,
     hid_io::{HidReportReciever, MockHidIo},
-    pointer::{absolute_pointer_get_state, absolute_pointer_reset, wait_for_pointer, AXIS_RESOLUTION, CENTER},
+    pointer::{
+      absolute_pointer_get_state, absolute_pointer_reset, wait_for_pointer, PointerContext, AXIS_RESOLUTION, CENTER,
+    },
   };
   use r_efi::{efi, protocols::absolute_pointer};
 
@@ -656,7 +660,7 @@ mod test {
   }
 
   #[test]
-  fn successful_initialize_should_install_protocol_and_drop_should_tear_it_down() {
+  fn successful_pointer_initialize_should_install_protocol_and_drop_should_tear_it_down() {
     // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
     // to emulate this without actually creating a static, use a raw pointer.
     let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
@@ -689,6 +693,8 @@ mod test {
 
       let controller = 0x2 as efi::Handle;
       assert_eq!(pointer_handler.initialize(controller, &hid_io), Ok(()));
+
+      assert_ne!(unsafe { ABS_PTR_INTERFACE }, core::ptr::null_mut());
     }
 
     //drop the faux static boot services.
@@ -862,7 +868,6 @@ mod test {
       assert_eq!(pointer_handler.current_state.current_y, 256);
       assert_eq!(pointer_handler.current_state.current_z, 0);
       assert_eq!(pointer_handler.state_changed, true);
-
     }
 
     //drop the faux static boot services.
@@ -870,7 +875,7 @@ mod test {
   }
 
   #[test]
-  fn bad_reports_should_be_dropped() {
+  fn bad_reports_should_be_ignored() {
     // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
     // to emulate this without actually creating a static, use a raw pointer.
     let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
@@ -956,8 +961,6 @@ mod test {
     unsafe { drop(Box::from_raw(raw_boot_services)) };
   }
 
-
-
   #[test]
   fn wait_for_event_should_wait_for_event() {
     // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
@@ -968,7 +971,7 @@ mod test {
     {
       const AGENT_HANDLE: efi::Handle = 0x01 as efi::Handle;
       const CONTROLLER_HANDLE: efi::Handle = 0x02 as efi::Handle;
-      const EVENT_HANDLE: efi::Handle = 0x03 as efi::Handle;
+      const POINTER_EVENT: efi::Event = 0x03 as efi::Event;
 
       static mut ABS_PTR_INTERFACE: *mut c_void = core::ptr::null_mut();
       static mut EVENT_CONTEXT: *mut c_void = core::ptr::null_mut();
@@ -980,7 +983,7 @@ mod test {
         assert_ne!(context, core::ptr::null_mut());
         unsafe {
           EVENT_CONTEXT = context;
-          event_ptr.write(EVENT_HANDLE);
+          event_ptr.write(POINTER_EVENT);
         }
         efi::Status::SUCCESS
       });
@@ -1010,7 +1013,7 @@ mod test {
       });
 
       boot_services.expect_signal_event().returning(|event| {
-        assert_eq!(event, EVENT_HANDLE);
+        assert_eq!(event, POINTER_EVENT);
         unsafe { EVENT_SIGNALED = true };
         efi::Status::SUCCESS
       });
@@ -1025,8 +1028,11 @@ mod test {
       let controller = CONTROLLER_HANDLE;
       assert_eq!(pointer_handler.initialize(controller, &hid_io), Ok(()));
 
+      let absolute_pointer = unsafe { (ABS_PTR_INTERFACE as *mut PointerContext).as_mut() }.unwrap();
+      assert_eq!(absolute_pointer.absolute_pointer.wait_for_input, POINTER_EVENT);
+
       // no pointer state change - should not signal event.
-      wait_for_pointer(EVENT_HANDLE, unsafe { EVENT_CONTEXT });
+      wait_for_pointer(POINTER_EVENT, unsafe { EVENT_CONTEXT });
 
       assert_eq!(unsafe { EVENT_SIGNALED }, false);
 
@@ -1035,7 +1041,7 @@ mod test {
       pointer_handler.receive_report(report, &hid_io);
 
       // pointer state change in place - should signal event.
-      wait_for_pointer(EVENT_HANDLE, unsafe { EVENT_CONTEXT });
+      wait_for_pointer(POINTER_EVENT, unsafe { EVENT_CONTEXT });
       assert_eq!(unsafe { EVENT_SIGNALED }, true);
     }
 

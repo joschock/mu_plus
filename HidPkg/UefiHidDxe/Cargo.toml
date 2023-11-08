@@ -23,8 +23,11 @@ HiiKeyboardLayout = {workspace=true}
 memoffset = {workspace=true}
 r-efi = {workspace=true}
 rustversion = {workspace=true}
-RustBootServicesAllocatorDxe = {workspace=true}
 RustAdvancedLoggerDxe = {workspace=true}
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+RustBootServicesAllocatorDxe = {workspace=true}
 
 [dev-dependencies]
 mockall = "0.11.4"
+scroll = {workspace=true}
