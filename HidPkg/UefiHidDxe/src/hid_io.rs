@@ -29,7 +29,7 @@ pub trait HidIo {
 
 #[cfg_attr(test, automock)]
 pub trait HidIoFactory {
-  fn new_hid_io(&self, controller: efi::Handle) -> Result<Box<dyn HidIo>, efi::Status>;
+  fn new_hid_io(&self, controller: efi::Handle, owned:bool) -> Result<Box<dyn HidIo>, efi::Status>;
 }
 
 pub struct UefiHidIoFactory {
@@ -44,8 +44,8 @@ impl UefiHidIoFactory {
 }
 
 impl HidIoFactory for UefiHidIoFactory {
-  fn new_hid_io(&self, controller: efi::Handle) -> Result<Box<dyn HidIo>, efi::Status> {
-    let hid_io = UefiHidIo::new(self.boot_services, self.agent, controller)?;
+  fn new_hid_io(&self, controller: efi::Handle, owned:bool) -> Result<Box<dyn HidIo>, efi::Status> {
+    let hid_io = UefiHidIo::new(self.boot_services, self.agent, controller, owned)?;
     Ok(Box::new(hid_io))
   }
 }
@@ -56,6 +56,7 @@ pub struct UefiHidIo {
   controller: efi::Handle,
   agent: efi::Handle,
   receiver: Option<Box<dyn HidReportReciever>>,
+  owned: bool
 }
 
 impl UefiHidIo {
@@ -63,8 +64,17 @@ impl UefiHidIo {
     boot_services: &'static dyn UefiBootServices,
     agent: efi::Handle,
     controller: efi::Handle,
+    owned: bool
   ) -> Result<Self, efi::Status> {
     let mut hid_io_ptr: *mut hid_io::protocol::Protocol = core::ptr::null_mut();
+
+    let attributes = {
+      if owned {
+        efi::OPEN_PROTOCOL_BY_DRIVER
+      } else {
+        efi::OPEN_PROTOCOL_GET_PROTOCOL
+      }
+    };
 
     let status = boot_services.open_protocol(
       controller,
@@ -72,7 +82,7 @@ impl UefiHidIo {
       core::ptr::addr_of_mut!(hid_io_ptr) as *mut *mut c_void,
       agent,
       controller,
-      efi::OPEN_PROTOCOL_BY_DRIVER,
+      attributes,
     );
 
     if status.is_error() {
@@ -80,7 +90,7 @@ impl UefiHidIo {
     }
 
     let hid_io = unsafe { hid_io_ptr.as_mut().expect("bad hid_io ptr") };
-    Ok(Self { hid_io, boot_services, controller, agent, receiver: None })
+    Ok(Self { hid_io, boot_services, controller, agent, receiver: None, owned })
   }
 
   extern "efiapi" fn report_callback(report_buffer_size: u16, report_buffer: *mut c_void, context: *mut c_void) {
@@ -95,16 +105,18 @@ impl UefiHidIo {
 
 impl Drop for UefiHidIo {
   fn drop(&mut self) {
-    let _ = self.take_report_receiver();
-    let status = self.boot_services.close_protocol(
-      self.controller,
-      &hid_io::protocol::GUID as *const efi::Guid as *mut efi::Guid,
-      self.agent,
-      self.controller,
-    );
-    if status.is_error() {
-      #[cfg(not(test))]
-      debugln!(DEBUG_ERROR, "Unexpected error closing hid_io: {:x?}", status);
+    if self.owned {
+      let _ = self.take_report_receiver();
+      let status = self.boot_services.close_protocol(
+        self.controller,
+        &hid_io::protocol::GUID as *const efi::Guid as *mut efi::Guid,
+        self.agent,
+        self.controller,
+      );
+      if status.is_error() {
+        #[cfg(not(test))]
+        debugln!(DEBUG_ERROR, "Unexpected error closing hid_io: {:x?}", status);
+      }
     }
   }
 }
@@ -151,6 +163,9 @@ impl HidIo for UefiHidIo {
   }
 
   fn set_report_receiver(&mut self, receiver: Box<dyn HidReportReciever>) -> Result<(), efi::Status> {
+    if !self.owned {
+      return Err(efi::Status::ACCESS_DENIED);
+    }
     let self_ptr = self as *mut UefiHidIo;
 
     //always attempt uninstall. Failure is ok if not already installed. This shuts down report callback generation
@@ -166,6 +181,9 @@ impl HidIo for UefiHidIo {
     Ok(())
   }
   fn take_report_receiver(&mut self) -> Option<Box<dyn HidReportReciever>> {
+    if !self.owned {
+      return None;
+    }
     //always attempt uninstall. Failure is ok if not already installed. This shuts down report callback generation
     //(if any) so that callbacks are not occuring before the receiver is removed.
     let _ = (self.hid_io.unregister_report_callback)(self.hid_io, Self::report_callback);
@@ -326,7 +344,7 @@ mod test {
         efi::Status::SUCCESS
       });
 
-      let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller).unwrap();
+      let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller, true).unwrap();
       drop(uefi_hid_io);
     }
 
@@ -353,7 +371,7 @@ mod test {
 
       boot_services.expect_close_protocol().returning(|_, _, _, _| efi::Status::SUCCESS);
 
-      let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller).unwrap();
+      let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller, true).unwrap();
       let descriptor = uefi_hid_io.get_report_descriptor().unwrap();
       assert_eq!(descriptor, hidparser::parse_report_descriptor(&MINIMAL_BOOT_KEYBOARD_REPORT_DESCRIPTOR).unwrap());
       drop(uefi_hid_io);
@@ -380,7 +398,7 @@ mod test {
 
       boot_services.expect_close_protocol().returning(|_, _, _, _| efi::Status::SUCCESS);
 
-      let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller).unwrap();
+      let uefi_hid_io = UefiHidIo::new(boot_services, agent, controller, true).unwrap();
 
       uefi_hid_io.set_output_report(None, &TEST_REPORT0).unwrap();
       uefi_hid_io.set_output_report(Some(1), &TEST_REPORT1).unwrap();
@@ -411,7 +429,7 @@ mod test {
 
       boot_services.expect_close_protocol().returning(|_, _, _, _| efi::Status::SUCCESS);
 
-      let mut uefi_hid_io = UefiHidIo::new(boot_services, agent, controller).unwrap();
+      let mut uefi_hid_io = UefiHidIo::new(boot_services, agent, controller, true).unwrap();
 
       let mut mock_receiver = MockHidReportReciever::new();
       mock_receiver

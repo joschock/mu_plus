@@ -14,7 +14,7 @@ use r_efi::{efi, hii, protocols};
 
 use crate::{
   boot_services::UefiBootServices,
-  hid_io::{HidIo, HidReportReciever},
+  hid_io::{HidIo, HidReportReciever, UefiHidIoFactory, HidIoFactory},
   key_queue,
 };
 
@@ -659,6 +659,33 @@ impl KeyboardHidHandler {
     }
     Ok(())
   }
+  fn reset(&mut self, extended_verification: bool) -> Result<(), efi::Status> {
+    self.last_keys.clear();
+    self.current_keys.clear();
+    self.key_queue.reset(extended_verification.into());
+    if extended_verification {
+      let controller = self.controller.expect("keyboard handler not initialized");
+      // For simplicity, UefiHidIoFactory is used directly here to get a hid_io instance to send an LED report.
+      // This avoids having to manage a hid_io or hid_io_factory trait object reference on self.
+      let hid_factory = UefiHidIoFactory::new(self.boot_services, self.agent);
+      let hid_io = hid_factory.new_hid_io(controller, false);
+      if let Ok(hid_io) = hid_io {
+        for (id,output_report) in self.generate_led_output_reports() {
+          let result = hid_io.set_output_report(id.map(|x| u32::from(x) as u8), &output_report);
+          if let Err(result) = result {
+            #[cfg(not(test))]
+            debugln!(DEBUG_ERROR, "unexpected error sending output report: {:?}", result);
+            return Err(efi::Status::DEVICE_ERROR);
+          }
+        }
+      } else {
+        #[cfg(not(test))]
+        debugln!(DEBUG_ERROR, "simple_text_in_reset: failed to get an instance of hid_io for LED reset.");
+        return Err(efi::Status::DEVICE_ERROR);
+      }
+    }
+    Ok(())
+  }
 }
 
 impl HidReportReciever for KeyboardHidHandler {
@@ -785,10 +812,32 @@ impl Drop for KeyboardHidHandler {
 
 // resets the keyboard state - part of the simple_text_in protocol interface.
 extern "efiapi" fn simple_text_in_reset(
-  _this: *mut protocols::simple_text_input::Protocol,
-  _extended_verification: efi::Boolean,
+  this: *mut protocols::simple_text_input::Protocol,
+  extended_verification: efi::Boolean,
 ) -> efi::Status {
-  todo!()
+  if this.is_null() {
+    return efi::Status::INVALID_PARAMETER;
+  }
+  let context = unsafe {(this as *mut SimpleTextInContext).as_mut()}.expect("bad pointer");
+  let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+  let mut status = efi::Status::SUCCESS;
+  'reset_processing: {
+    let keyboard_handler = unsafe {context.keyboard_handler.as_mut()};
+    if let Some(keyboard_handler) = keyboard_handler {
+      match keyboard_handler.reset(extended_verification.into()) {
+        Err(err) => {
+          status = err;
+          break 'reset_processing;
+        }
+        _ => ()
+      }
+    } else {
+      status = efi::Status::DEVICE_ERROR;
+      break 'reset_processing;
+    }
+  }
+  context.boot_services.restore_tpl(old_tpl);
+  status
 }
 
 // reads a key stroke - part of the simple_text_in protocol interface.
@@ -806,10 +855,32 @@ extern "efiapi" fn simple_text_in_wait_for_key(_event: efi::Event, _context: *mu
 
 // resets the keyboard state - part of the simple_text_in_ex protocol interface.
 extern "efiapi" fn simple_text_in_ex_reset(
-  _this: *mut protocols::simple_text_input_ex::Protocol,
-  _extended_verification: efi::Boolean,
+  this: *mut protocols::simple_text_input_ex::Protocol,
+  extended_verification: efi::Boolean,
 ) -> efi::Status {
-  todo!()
+  if this.is_null() {
+    return efi::Status::INVALID_PARAMETER;
+  }
+  let context = unsafe {(this as *mut SimpleTextInExContext).as_mut()}.expect("bad pointer");
+  let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+  let mut status = efi::Status::SUCCESS;
+  'reset_processing: {
+    let keyboard_handler = unsafe {context.keyboard_handler.as_mut()};
+    if let Some(keyboard_handler) = keyboard_handler {
+      match keyboard_handler.reset(extended_verification.into()) {
+        Err(err) => {
+          status = err;
+          break 'reset_processing;
+        }
+        _ => ()
+      }
+    } else {
+      status = efi::Status::DEVICE_ERROR;
+      break 'reset_processing;
+    }
+  }
+  context.boot_services.restore_tpl(old_tpl);
+  status
 }
 
 // reads a key stroke - part of the simple_text_in_ex protocol interface.
@@ -859,69 +930,75 @@ extern "efiapi" fn process_key_notifies(_event: efi::Event, _context: *mut c_voi
 
 extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut c_void) {
   let context = unsafe { (context as *mut LayoutChangeContext).as_mut() }.expect("bad context pointer");
+  let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
 
-  if context.keyboard_handler.is_null() {
-    #[cfg(not(test))]
-    debugln!(DEBUG_ERROR, "Call to layout update with null keyboard handler");
-    return;
-  }
-
-  let keyboard_handler = unsafe { context.keyboard_handler.as_mut() }.expect("bad keyboard handler");
-
-  let mut hii_database_protocol_ptr: *mut protocols::hii_database::Protocol = core::ptr::null_mut();
-  let status = context.boot_services.locate_protocol(
-    &protocols::hii_database::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
-    core::ptr::null_mut(),
-    core::ptr::addr_of_mut!(hii_database_protocol_ptr) as *mut *mut c_void,
-  );
-
-  if status.is_error() {
-    //nothing to do if there is no hii protocol.
-    return;
-  }
-
-  let hii_database_protocol =
-    unsafe { hii_database_protocol_ptr.as_mut().expect("Bad pointer returned from successful locate protocol.") };
-
-  // retrieve keyboard layout size
-  let mut layout_buffer_len: u16 = 0;
-  let status = (hii_database_protocol.get_keyboard_layout)(
-    hii_database_protocol_ptr,
-    core::ptr::null_mut(),
-    &mut layout_buffer_len as *mut u16,
-    core::ptr::null_mut(),
-  );
-  if status != efi::Status::BUFFER_TOO_SMALL {
-    #[cfg(not(test))]
-    debugln!(DEBUG_ERROR, "Unexpected return from get_keyboard_layout when trying to determine length: {:x?}", status);
-    return;
-  }
-
-  let mut keyboard_layout_buffer = vec![0u8; layout_buffer_len as usize];
-  let status = (hii_database_protocol.get_keyboard_layout)(
-    hii_database_protocol_ptr,
-    core::ptr::null_mut(),
-    &mut layout_buffer_len as *mut u16,
-    keyboard_layout_buffer.as_mut_ptr() as *mut protocols::hii_database::KeyboardLayout<0>,
-  );
-
-  if status.is_error() {
-    #[cfg(not(test))]
-    debugln!(DEBUG_ERROR, "Unexpected return from get_keyboard_layout: {:x?}", status);
-    return;
-  }
-
-  let keyboard_layout = hii_keyboard_layout::keyboard_layout_from_buffer(&keyboard_layout_buffer);
-  match keyboard_layout {
-    Ok(keyboard_layout) => {
-      keyboard_handler.key_queue.set_layout(Some(keyboard_layout));
-    }
-    Err(_) => {
+  'layout_processing: {
+    if context.keyboard_handler.is_null() {
       #[cfg(not(test))]
-      debugln!(DEBUG_ERROR, "keyboard::on_layout_update: Could not parse keyboard layout buffer.");
-      return;
+      debugln!(DEBUG_ERROR, "on_layout_update invoked with invalid handler");
+      break 'layout_processing;
+    }
+
+    let keyboard_handler = unsafe { context.keyboard_handler.as_mut() }.expect("bad keyboard handler");
+
+    let mut hii_database_protocol_ptr: *mut protocols::hii_database::Protocol = core::ptr::null_mut();
+    let status = context.boot_services.locate_protocol(
+      &protocols::hii_database::PROTOCOL_GUID as *const efi::Guid as *mut efi::Guid,
+      core::ptr::null_mut(),
+      core::ptr::addr_of_mut!(hii_database_protocol_ptr) as *mut *mut c_void,
+    );
+
+    if status.is_error() {
+      //nothing to do if there is no hii protocol.
+      break 'layout_processing;
+    }
+
+    let hii_database_protocol =
+      unsafe { hii_database_protocol_ptr.as_mut().expect("Bad pointer returned from successful locate protocol.") };
+
+    // retrieve keyboard layout size
+    let mut layout_buffer_len: u16 = 0;
+    let status = (hii_database_protocol.get_keyboard_layout)(
+      hii_database_protocol_ptr,
+      core::ptr::null_mut(),
+      &mut layout_buffer_len as *mut u16,
+      core::ptr::null_mut(),
+    );
+    if status != efi::Status::BUFFER_TOO_SMALL {
+      #[cfg(not(test))]
+      debugln!(DEBUG_ERROR, "Unexpected return from get_keyboard_layout when trying to determine length: {:x?}", status);
+      break 'layout_processing;
+    }
+
+    let mut keyboard_layout_buffer = vec![0u8; layout_buffer_len as usize];
+    let status = (hii_database_protocol.get_keyboard_layout)(
+      hii_database_protocol_ptr,
+      core::ptr::null_mut(),
+      &mut layout_buffer_len as *mut u16,
+      keyboard_layout_buffer.as_mut_ptr() as *mut protocols::hii_database::KeyboardLayout<0>,
+    );
+
+    if status.is_error() {
+      #[cfg(not(test))]
+      debugln!(DEBUG_ERROR, "Unexpected return from get_keyboard_layout: {:x?}", status);
+      break 'layout_processing;
+    }
+
+    let keyboard_layout = hii_keyboard_layout::keyboard_layout_from_buffer(&keyboard_layout_buffer);
+    match keyboard_layout {
+      Ok(keyboard_layout) => {
+        keyboard_handler.key_queue.set_layout(Some(keyboard_layout));
+      }
+      Err(_) => {
+        #[cfg(not(test))]
+        debugln!(DEBUG_ERROR, "keyboard::on_layout_update: Could not parse keyboard layout buffer.");
+        break 'layout_processing;
+      }
     }
   }
+
+  context.boot_services.restore_tpl(old_tpl);
+
 }
 
 #[cfg(test)]
@@ -940,11 +1017,11 @@ mod test {
     hid_io::{HidReportReciever, MockHidIo},
     keyboard::{
       on_layout_update, process_key_notifies, simple_text_in_ex_wait_for_key, simple_text_in_wait_for_key,
-      KeyboardHidHandler,
+      KeyboardHidHandler, SimpleTextInExContext, simple_text_in_ex_reset, simple_text_in_ex_read_key_stroke, simple_text_in_ex_set_state, simple_text_in_ex_register_key_notify, simple_text_in_ex_unregister_key_notify,
     },
   };
 
-  use super::LayoutChangeContext;
+  use super::{LayoutChangeContext, SimpleTextInContext, simple_text_in_reset, simple_text_in_read_key_stroke};
 
   static BOOT_KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &[
     0x05, 0x01, // USAGE_PAGE (Generic Desktop)
@@ -1487,6 +1564,126 @@ mod test {
 
       on_layout_update(event, context as *mut c_void);
       assert_eq!(&keyboard_handler.key_queue.get_layout().unwrap(), unsafe { &TEST_KEYBOARD_LAYOUT });
+    }
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn reset_should_reset_keyboard() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    {
+      boot_services.expect_raise_tpl().returning(|_| efi::TPL_APPLICATION);
+      boot_services.expect_restore_tpl().returning(|_| ());
+      boot_services.expect_signal_event().returning(|_| efi::Status::SUCCESS);
+
+      extern "efiapi" fn mock_set_report(
+        _this: *const hid_io::protocol::Protocol,
+        _report_id: u8,
+        _report_type: hid_io::protocol::HidReportType,
+        _report_buffer_size: usize,
+        _report_buffer: *mut c_void,
+      ) -> efi::Status {
+        efi::Status::SUCCESS
+      }
+
+      boot_services.expect_open_protocol()
+        .returning(|_,protocol,interface,_,_,attributes|
+          {
+            unsafe {
+              assert_eq!(protocol.read(), hid_io::protocol::GUID);
+              assert_eq!(attributes, efi::OPEN_PROTOCOL_GET_PROTOCOL);
+              let hid_io = MaybeUninit::<hid_io::protocol::Protocol>::zeroed();
+              let mut hid_io = hid_io.assume_init();
+              hid_io.set_report = mock_set_report;
+              // note: this will leak a hid_io instance
+              interface.write(Box::into_raw(Box::new(hid_io)) as *mut c_void);
+            }
+            efi::Status::SUCCESS
+          });
+
+      let agent = 0x1 as efi::Handle;
+      let mut keyboard_handler = KeyboardHidHandler::new(boot_services, agent);
+      let descriptor = hidparser::parse_report_descriptor(&BOOT_KEYBOARD_REPORT_DESCRIPTOR).unwrap();
+      keyboard_handler.process_descriptor(descriptor).unwrap();
+      keyboard_handler.key_queue.set_layout(Some(hii_keyboard_layout::get_default_keyboard_layout()));
+      keyboard_handler.controller = Some(0x2 as efi::Handle); //pretend full init has occurred.
+
+      // test SimpleTextIn::reset
+      let context = SimpleTextInContext {
+        simple_text_in: protocols::simple_text_input::Protocol {
+          reset: simple_text_in_reset,
+          read_key_stroke: simple_text_in_read_key_stroke,
+          wait_for_key: core::ptr::null_mut()
+        },
+        boot_services,
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
+      };
+
+      let mut hid_io = MockHidIo::new();
+      hid_io.expect_set_output_report().returning(|_,_|Ok(()));
+
+      //buffer CapsLock + a, b, c
+      let report: &[u8] = &[0x00, 0x00, 0x39, 0x04, 0x04, 0x05, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      assert!(keyboard_handler.key_queue.peek_key().is_some());
+      assert!(!keyboard_handler.led_state.is_empty());
+      let prev_led_state = keyboard_handler.led_state.clone();
+      assert!(!keyboard_handler.last_keys.is_empty());
+
+      let this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input::Protocol;
+      let status = simple_text_in_reset(this_ptr, efi::Boolean::from(false));
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert!(keyboard_handler.key_queue.peek_key().is_none());
+      assert!(keyboard_handler.last_keys.is_empty());
+      assert_eq!(keyboard_handler.led_state, prev_led_state);
+
+      let status = simple_text_in_reset(this_ptr, efi::Boolean::from(true));
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert!(keyboard_handler.led_state.is_empty());
+
+      //test SimpleTextInEx::reset
+      let context: SimpleTextInExContext = SimpleTextInExContext {
+        simple_text_in_ex: protocols::simple_text_input_ex::Protocol {
+          reset: simple_text_in_ex_reset,
+          read_key_stroke_ex: simple_text_in_ex_read_key_stroke,
+          set_state: simple_text_in_ex_set_state,
+          register_key_notify: simple_text_in_ex_register_key_notify,
+          unregister_key_notify: simple_text_in_ex_unregister_key_notify,
+          wait_for_key_ex: core::ptr::null_mut()
+        },
+        boot_services,
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
+      };
+
+      let mut hid_io = MockHidIo::new();
+      hid_io.expect_set_output_report().returning(|_,_|Ok(()));
+
+      //buffer CapsLock + a, b, c
+      let report: &[u8] = &[0x00, 0x00, 0x39, 0x04, 0x04, 0x05, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      assert!(keyboard_handler.key_queue.peek_key().is_some());
+      assert!(!keyboard_handler.led_state.is_empty());
+      let prev_led_state = keyboard_handler.led_state.clone();
+      assert!(!keyboard_handler.last_keys.is_empty());
+
+      let this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input_ex::Protocol;
+      let status = simple_text_in_ex_reset(this_ptr, efi::Boolean::from(false));
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert!(keyboard_handler.key_queue.peek_key().is_none());
+      assert!(keyboard_handler.last_keys.is_empty());
+      assert_eq!(keyboard_handler.led_state, prev_led_state);
+
+      let status = simple_text_in_ex_reset(this_ptr, efi::Boolean::from(true));
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert!(keyboard_handler.led_state.is_empty());
+
+      keyboard_handler.controller = None; //avoid boot services interactions in KeyboardHidHandler.drop().
     }
 
     //drop the faux static boot services.

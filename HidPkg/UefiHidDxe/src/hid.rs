@@ -53,14 +53,14 @@ impl DriverBinding for HidFactory {
     _boot_services: &'static dyn UefiBootServices,
     controller: r_efi::efi::Handle,
   ) -> Result<(), efi::Status> {
-    self.hid_io_factory.new_hid_io(controller).map(|_| ())
+    self.hid_io_factory.new_hid_io(controller, true).map(|_| ())
   }
   fn driver_binding_start(
     &mut self,
     boot_services: &'static dyn UefiBootServices,
     controller: r_efi::efi::Handle,
   ) -> Result<(), efi::Status> {
-    let mut hid_io = self.hid_io_factory.new_hid_io(controller)?;
+    let mut hid_io = self.hid_io_factory.new_hid_io(controller, true)?;
 
     let mut hid_splitter = Box::new(HidSplitter { receivers: Vec::new() });
 
@@ -177,10 +177,10 @@ mod test {
       //handle 0x3 should return success.
       hid_io_factory
         .expect_new_hid_io()
-        .withf_st(|controller| *controller == 0x3 as efi::Handle)
-        .returning(|_| Ok(Box::new(MockHidIo::new())));
+        .withf_st(|controller, _| *controller == 0x3 as efi::Handle)
+        .returning(|_,_| Ok(Box::new(MockHidIo::new())));
       //default for any other handles
-      hid_io_factory.expect_new_hid_io().returning(|_| Err(efi::Status::UNSUPPORTED));
+      hid_io_factory.expect_new_hid_io().returning(|_,_| Err(efi::Status::UNSUPPORTED));
 
       let receiver_factory = Box::new(MockHidReceiverFactory::new());
       let agent = 0x1 as efi::Handle;
@@ -207,14 +207,14 @@ mod test {
       let mut hid_io_factory = Box::new(MockHidIoFactory::new());
       hid_io_factory
         .expect_new_hid_io()
-        .withf_st(|controller| *controller == 0x3 as efi::Handle)
-        .returning(|_| Ok(Box::new(MockHidIo::new())));
+        .withf_st(|controller,_| *controller == 0x3 as efi::Handle)
+        .returning(|_,_| Ok(Box::new(MockHidIo::new())));
       hid_io_factory
         .expect_new_hid_io()
-        .withf_st(|controller| *controller == 0x4 as efi::Handle)
-        .returning(|_| Ok(Box::new(MockHidIo::new())));
+        .withf_st(|controller,_| *controller == 0x4 as efi::Handle)
+        .returning(|_,_| Ok(Box::new(MockHidIo::new())));
       //default for any other handles
-      hid_io_factory.expect_new_hid_io().returning(|_| Err(efi::Status::UNSUPPORTED));
+      hid_io_factory.expect_new_hid_io().returning(|_,_| Err(efi::Status::UNSUPPORTED));
 
       let mut receiver_factory = Box::new(MockHidReceiverFactory::new());
       receiver_factory
@@ -243,7 +243,7 @@ mod test {
 
       //test: hid_io present, receiver present, receiver init indicates no support.
       let mut hid_io_factory = Box::new(MockHidIoFactory::new());
-      hid_io_factory.expect_new_hid_io().returning(|_| Ok(Box::new(MockHidIo::new())));
+      hid_io_factory.expect_new_hid_io().returning(|_,_| Ok(Box::new(MockHidIo::new())));
 
       let mut receiver_factory = Box::new(MockHidReceiverFactory::new());
       receiver_factory.expect_new_hid_receiver_list().returning(|_| {
@@ -275,7 +275,7 @@ mod test {
       let agent = 0x1 as efi::Handle;
 
       let mut hid_io_factory = Box::new(MockHidIoFactory::new());
-      hid_io_factory.expect_new_hid_io().returning(|_| {
+      hid_io_factory.expect_new_hid_io().returning(|_,_| {
         let mut hid_io = MockHidIo::new();
         hid_io.expect_set_report_receiver().returning(|_| Ok(()));
         Ok(Box::new(hid_io))
@@ -312,7 +312,7 @@ mod test {
       let agent = 0x1 as efi::Handle;
 
       let mut hid_io_factory = Box::new(MockHidIoFactory::new());
-      hid_io_factory.expect_new_hid_io().returning(|_| {
+      hid_io_factory.expect_new_hid_io().returning(|_,_| {
         let mut hid_io = MockHidIo::new();
         hid_io.expect_set_report_receiver().returning(|_| Ok(()));
         Ok(Box::new(hid_io))

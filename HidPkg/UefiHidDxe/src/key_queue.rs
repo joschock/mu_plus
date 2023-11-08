@@ -130,8 +130,13 @@ pub(crate) struct KeyQueue {
 
 impl KeyQueue {
   // resets the KeyQueue to initial state
-  pub(crate) fn reset(&mut self) {
-    self.active_modifiers.clear();
+  pub(crate) fn reset(&mut self, extended_reset:bool) {
+    if extended_reset {
+      self.active_modifiers.clear();
+    } else {
+      let active_leds = self.get_active_led_modifiers();
+      self.active_modifiers.retain(|x| active_leds.contains(x));
+    }
     self.active_ns_key = None;
     self.partial_key_support_active = false;
     self.key_queue.clear();
@@ -397,6 +402,9 @@ impl KeyQueue {
     self.partial_key_support_active = (toggle_state & KEY_STATE_EXPOSED) != 0;
   }
 
+  fn get_active_led_modifiers(&self) -> Vec<u16> {
+    self.active_modifiers.iter().cloned().filter(|x|modifer_to_led_usage(*x).is_some()).collect()
+  }
   // Returns a vector of HID usages corresponding to the active LEDs based on the active modifier state.
   pub(crate) fn get_active_leds(&self) -> Vec<Usage> {
     self.active_modifiers.iter().cloned().filter_map(|x| modifer_to_led_usage(x)).collect()
