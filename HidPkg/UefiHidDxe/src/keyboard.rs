@@ -842,10 +842,52 @@ extern "efiapi" fn simple_text_in_reset(
 
 // reads a key stroke - part of the simple_text_in protocol interface.
 extern "efiapi" fn simple_text_in_read_key_stroke(
-  _this: *mut protocols::simple_text_input::Protocol,
-  _key: *mut protocols::simple_text_input::InputKey,
+  this: *mut protocols::simple_text_input::Protocol,
+  key: *mut protocols::simple_text_input::InputKey,
 ) -> efi::Status {
-  todo!()
+  if this.is_null() || key.is_null() {
+    return efi::Status::INVALID_PARAMETER;
+  }
+  let context = unsafe {(this as *mut SimpleTextInContext).as_mut()}.expect("bad pointer");
+  let mut status = efi::Status::SUCCESS;
+  let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+  'read_key_stroke: {
+    let keyboard_handler = unsafe {context.keyboard_handler.as_mut()};
+    if let Some(keyboard_handler) = keyboard_handler {
+      loop {
+        if let Some(mut key_data) = keyboard_handler.key_queue.pop_key() {
+          // skip partials
+          if key_data.key.unicode_char == 0 && key_data.key.scan_code == 0 {
+            continue;
+          }
+          //translate ctrl-alpha to corresponding control value. ctrl-a = 0x0001, ctrl-z = 0x001A
+          const CONTROL_PRESSED:u32 =
+            protocols::simple_text_input_ex::RIGHT_CONTROL_PRESSED |
+            protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED;
+          if (key_data.key_state.key_shift_state & CONTROL_PRESSED) != 0 {
+            if key_data.key.unicode_char >= 0x0061 && key_data.key.unicode_char <= 0x007a {
+              //'a' to 'z'
+              key_data.key.unicode_char = (key_data.key.unicode_char - 0x0061) + 1;
+            }
+            if key_data.key.unicode_char >= 0x0041 && key_data.key.unicode_char <= 0x005a {
+              //'A' to 'Z'
+              key_data.key.unicode_char = (key_data.key.unicode_char - 0x0041) + 1;
+            }
+          }
+          unsafe { key.write(key_data.key) }
+          status = efi::Status::SUCCESS;
+        } else {
+          status = efi::Status::NOT_READY;
+        }
+        break 'read_key_stroke;
+      }
+    } else {
+      status = efi::Status::DEVICE_ERROR;
+      break 'read_key_stroke;
+    }
+  }
+  context.boot_services.restore_tpl(old_tpl);
+  status
 }
 
 // Event handler function for the wait_for_key_event
@@ -1672,7 +1714,7 @@ mod test {
       let prev_led_state = keyboard_handler.led_state.clone();
       assert!(!keyboard_handler.last_keys.is_empty());
 
-      let this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input_ex::Protocol;
+    let this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input_ex::Protocol;
       let status = simple_text_in_ex_reset(this_ptr, efi::Boolean::from(false));
       assert_eq!(status, efi::Status::SUCCESS);
       assert!(keyboard_handler.key_queue.peek_key().is_none());
@@ -1684,6 +1726,124 @@ mod test {
       assert!(keyboard_handler.led_state.is_empty());
 
       keyboard_handler.controller = None; //avoid boot services interactions in KeyboardHidHandler.drop().
+    }
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn read_key_stroke_should_return_key_data() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    {
+      boot_services.expect_raise_tpl().returning(|_| efi::TPL_APPLICATION);
+      boot_services.expect_restore_tpl().returning(|_| ());
+      boot_services.expect_signal_event().returning(|_| efi::Status::SUCCESS);
+
+      let agent = 0x1 as efi::Handle;
+      let mut keyboard_handler = KeyboardHidHandler::new(boot_services, agent);
+      let descriptor = hidparser::parse_report_descriptor(&BOOT_KEYBOARD_REPORT_DESCRIPTOR).unwrap();
+      keyboard_handler.process_descriptor(descriptor).unwrap();
+      keyboard_handler.key_queue.set_layout(Some(hii_keyboard_layout::get_default_keyboard_layout()));
+
+      let hid_io = MockHidIo::new();
+
+      //send 'a', 'b', 'c'. Simultaneous key stroke ordering is not defined by spec, but this implementation processes
+      //them in descending usage code order, so 'c', 'b', 'a'.
+      let report: &[u8] = &[0x00, 0x00, 0x04, 0x05, 0x06, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      //release keys
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      // build a simple text in context
+      let context = SimpleTextInContext {
+        simple_text_in: protocols::simple_text_input::Protocol {
+          reset: simple_text_in_reset,
+          read_key_stroke: simple_text_in_read_key_stroke,
+          wait_for_key: core::ptr::null_mut()
+        },
+        boot_services,
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
+      };
+
+      let this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input::Protocol;
+      let mut key_data: protocols::simple_text_input::InputKey = Default::default();
+      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(key_data.unicode_char, 'c' as u16);
+      assert_eq!(key_data.scan_code, 0);
+
+      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(key_data.unicode_char, 'b' as u16);
+      assert_eq!(key_data.scan_code, 0);
+
+      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(key_data.unicode_char, 'a' as u16);
+      assert_eq!(key_data.scan_code, 0);
+
+      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      assert_eq!(status, efi::Status::NOT_READY);
+
+      //send ctrl-a - expect it to be switched to control-character 0x01
+      let report: &[u8] = &[0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      //release keys
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(key_data.unicode_char, 0x1);
+      assert_eq!(key_data.scan_code, 0);
+
+      //send ctrl-shift-Z - expect it to be switched to control-character 0x1A
+      let report: &[u8] = &[0x03, 0x00, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      //release keys
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(key_data.unicode_char, 0x1a);
+      assert_eq!(key_data.scan_code, 0);
+
+      // enable partial keystrokes
+      keyboard_handler.key_queue.set_key_toggle_state(protocols::simple_text_input_ex::KEY_STATE_EXPOSED);
+
+      // press the right logo key
+      let report: &[u8] = &[0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      //release keys
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      //make sure there is a partial key stroke in the queue
+      assert_eq!(keyboard_handler.key_queue.peek_key().unwrap().key.unicode_char, 0);
+      assert_eq!(keyboard_handler.key_queue.peek_key().unwrap().key.scan_code, 0);
+
+      // press the a key
+      let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      //release keys
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      // should get only the 'a', partial keystroke should be dropped.
+      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(key_data.unicode_char, 'a' as u16);
+      assert_eq!(key_data.scan_code, 0);
+
+      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      assert_eq!(status, efi::Status::NOT_READY);
     }
 
     //drop the faux static boot services.
