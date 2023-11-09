@@ -14,7 +14,7 @@ use r_efi::{efi, hii, protocols};
 
 use crate::{
   boot_services::UefiBootServices,
-  hid_io::{HidIo, HidReportReciever, UefiHidIoFactory, HidIoFactory},
+  hid_io::{HidIo, HidIoFactory, HidReportReciever, UefiHidIoFactory},
   key_queue,
 };
 
@@ -670,7 +670,7 @@ impl KeyboardHidHandler {
       let hid_factory = UefiHidIoFactory::new(self.boot_services, self.agent);
       let hid_io = hid_factory.new_hid_io(controller, false);
       if let Ok(hid_io) = hid_io {
-        for (id,output_report) in self.generate_led_output_reports() {
+        for (id, output_report) in self.generate_led_output_reports() {
           let result = hid_io.set_output_report(id.map(|x| u32::from(x) as u8), &output_report);
           if let Err(result) = result {
             #[cfg(not(test))]
@@ -818,18 +818,18 @@ extern "efiapi" fn simple_text_in_reset(
   if this.is_null() {
     return efi::Status::INVALID_PARAMETER;
   }
-  let context = unsafe {(this as *mut SimpleTextInContext).as_mut()}.expect("bad pointer");
+  let context = unsafe { (this as *mut SimpleTextInContext).as_mut() }.expect("bad pointer");
   let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
   let mut status = efi::Status::SUCCESS;
   'reset_processing: {
-    let keyboard_handler = unsafe {context.keyboard_handler.as_mut()};
+    let keyboard_handler = unsafe { context.keyboard_handler.as_mut() };
     if let Some(keyboard_handler) = keyboard_handler {
       match keyboard_handler.reset(extended_verification.into()) {
         Err(err) => {
           status = err;
           break 'reset_processing;
         }
-        _ => ()
+        _ => (),
       }
     } else {
       status = efi::Status::DEVICE_ERROR;
@@ -848,11 +848,11 @@ extern "efiapi" fn simple_text_in_read_key_stroke(
   if this.is_null() || key.is_null() {
     return efi::Status::INVALID_PARAMETER;
   }
-  let context = unsafe {(this as *mut SimpleTextInContext).as_mut()}.expect("bad pointer");
+  let context = unsafe { (this as *mut SimpleTextInContext).as_mut() }.expect("bad pointer");
   let mut status = efi::Status::SUCCESS;
   let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
   'read_key_stroke: {
-    let keyboard_handler = unsafe {context.keyboard_handler.as_mut()};
+    let keyboard_handler = unsafe { context.keyboard_handler.as_mut() };
     if let Some(keyboard_handler) = keyboard_handler {
       loop {
         if let Some(mut key_data) = keyboard_handler.key_queue.pop_key() {
@@ -861,9 +861,8 @@ extern "efiapi" fn simple_text_in_read_key_stroke(
             continue;
           }
           //translate ctrl-alpha to corresponding control value. ctrl-a = 0x0001, ctrl-z = 0x001A
-          const CONTROL_PRESSED:u32 =
-            protocols::simple_text_input_ex::RIGHT_CONTROL_PRESSED |
-            protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED;
+          const CONTROL_PRESSED: u32 = protocols::simple_text_input_ex::RIGHT_CONTROL_PRESSED
+            | protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED;
           if (key_data.key_state.key_shift_state & CONTROL_PRESSED) != 0 {
             if key_data.key.unicode_char >= 0x0061 && key_data.key.unicode_char <= 0x007a {
               //'a' to 'z'
@@ -891,8 +890,36 @@ extern "efiapi" fn simple_text_in_read_key_stroke(
 }
 
 // Event handler function for the wait_for_key_event
-extern "efiapi" fn simple_text_in_wait_for_key(_event: efi::Event, _context: *mut c_void) {
-  todo!()
+extern "efiapi" fn simple_text_in_wait_for_key(event: efi::Event, context: *mut c_void) {
+  if context.is_null() {
+    #[cfg(not(test))]
+    debugln!(DEBUG_ERROR, "simple_text_in_wait_for_key invoked with invalid context");
+    return;
+  }
+  let context = unsafe { (context as *mut SimpleTextInContext).as_mut() }.expect("bad pointer");
+  let mut wait_complete: bool = false;
+  while !wait_complete {
+    let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+    {
+      if let Some(keyboard_handler) = unsafe { context.keyboard_handler.as_mut() } {
+        while let Some(key_data) = keyboard_handler.key_queue.peek_key() {
+          if key_data.key.unicode_char == 0 && key_data.key.scan_code == 0 {
+            // consume (and ignore) the partial stroke.
+            let _ = keyboard_handler.key_queue.pop_key();
+            continue;
+          } else {
+            // valid keystroke
+            context.boot_services.signal_event(event);
+            wait_complete = true;
+            break;
+          }
+        }
+      } else {
+        wait_complete = true;
+      }
+    }
+    context.boot_services.restore_tpl(old_tpl);
+  }
 }
 
 // resets the keyboard state - part of the simple_text_in_ex protocol interface.
@@ -903,18 +930,18 @@ extern "efiapi" fn simple_text_in_ex_reset(
   if this.is_null() {
     return efi::Status::INVALID_PARAMETER;
   }
-  let context = unsafe {(this as *mut SimpleTextInExContext).as_mut()}.expect("bad pointer");
+  let context = unsafe { (this as *mut SimpleTextInExContext).as_mut() }.expect("bad pointer");
   let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
   let mut status = efi::Status::SUCCESS;
   'reset_processing: {
-    let keyboard_handler = unsafe {context.keyboard_handler.as_mut()};
+    let keyboard_handler = unsafe { context.keyboard_handler.as_mut() };
     if let Some(keyboard_handler) = keyboard_handler {
       match keyboard_handler.reset(extended_verification.into()) {
         Err(err) => {
           status = err;
           break 'reset_processing;
         }
-        _ => ()
+        _ => (),
       }
     } else {
       status = efi::Status::DEVICE_ERROR;
@@ -933,18 +960,18 @@ extern "efiapi" fn simple_text_in_ex_read_key_stroke(
   if this.is_null() || key_data.is_null() {
     return efi::Status::INVALID_PARAMETER;
   }
-  let context = unsafe {(this as *mut SimpleTextInExContext).as_mut()}.expect("bad pointer");
+  let context = unsafe { (this as *mut SimpleTextInExContext).as_mut() }.expect("bad pointer");
   let mut status = efi::Status::SUCCESS;
   let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
   'read_key_stroke: {
-    let keyboard_handler = unsafe {context.keyboard_handler.as_mut()};
+    let keyboard_handler = unsafe { context.keyboard_handler.as_mut() };
     if let Some(keyboard_handler) = keyboard_handler {
       if let Some(key) = keyboard_handler.key_queue.pop_key() {
-        unsafe {key_data.write(key)}
+        unsafe { key_data.write(key) }
       } else {
         let mut key: protocols::simple_text_input_ex::KeyData = Default::default();
         key.key_state = keyboard_handler.key_queue.init_key_state();
-        unsafe {key_data.write(key)};
+        unsafe { key_data.write(key) };
         status = efi::Status::NOT_READY
       }
     } else {
@@ -1031,7 +1058,11 @@ extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut c_void) {
     );
     if status != efi::Status::BUFFER_TOO_SMALL {
       #[cfg(not(test))]
-      debugln!(DEBUG_ERROR, "Unexpected return from get_keyboard_layout when trying to determine length: {:x?}", status);
+      debugln!(
+        DEBUG_ERROR,
+        "Unexpected return from get_keyboard_layout when trying to determine length: {:x?}",
+        status
+      );
       break 'layout_processing;
     }
 
@@ -1063,12 +1094,18 @@ extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut c_void) {
   }
 
   context.boot_services.restore_tpl(old_tpl);
-
 }
 
 #[cfg(test)]
 mod test {
-  use core::{ffi::c_void, mem::MaybeUninit, slice::from_raw_parts_mut};
+  use core::{
+    ffi::c_void,
+    mem::MaybeUninit,
+    slice::from_raw_parts_mut,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+  };
+  use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
   use hii_keyboard_layout::{self, HiiKeyboardLayout};
   use r_efi::{
@@ -1081,12 +1118,13 @@ mod test {
     boot_services::MockUefiBootServices,
     hid_io::{HidReportReciever, MockHidIo},
     keyboard::{
-      on_layout_update, process_key_notifies, simple_text_in_ex_wait_for_key, simple_text_in_wait_for_key,
-      KeyboardHidHandler, SimpleTextInExContext, simple_text_in_ex_reset, simple_text_in_ex_read_key_stroke, simple_text_in_ex_set_state, simple_text_in_ex_register_key_notify, simple_text_in_ex_unregister_key_notify,
+      on_layout_update, process_key_notifies, simple_text_in_ex_read_key_stroke, simple_text_in_ex_register_key_notify,
+      simple_text_in_ex_reset, simple_text_in_ex_set_state, simple_text_in_ex_unregister_key_notify,
+      simple_text_in_ex_wait_for_key, simple_text_in_wait_for_key, KeyboardHidHandler, SimpleTextInExContext,
     },
   };
 
-  use super::{LayoutChangeContext, SimpleTextInContext, simple_text_in_reset, simple_text_in_read_key_stroke};
+  use super::{simple_text_in_read_key_stroke, simple_text_in_reset, LayoutChangeContext, SimpleTextInContext};
 
   static BOOT_KEYBOARD_REPORT_DESCRIPTOR: &[u8] = &[
     0x05, 0x01, // USAGE_PAGE (Generic Desktop)
@@ -1657,20 +1695,18 @@ mod test {
         efi::Status::SUCCESS
       }
 
-      boot_services.expect_open_protocol()
-        .returning(|_,protocol,interface,_,_,attributes|
-          {
-            unsafe {
-              assert_eq!(protocol.read(), hid_io::protocol::GUID);
-              assert_eq!(attributes, efi::OPEN_PROTOCOL_GET_PROTOCOL);
-              let hid_io = MaybeUninit::<hid_io::protocol::Protocol>::zeroed();
-              let mut hid_io = hid_io.assume_init();
-              hid_io.set_report = mock_set_report;
-              // note: this will leak a hid_io instance
-              interface.write(Box::into_raw(Box::new(hid_io)) as *mut c_void);
-            }
-            efi::Status::SUCCESS
-          });
+      boot_services.expect_open_protocol().returning(|_, protocol, interface, _, _, attributes| {
+        unsafe {
+          assert_eq!(protocol.read(), hid_io::protocol::GUID);
+          assert_eq!(attributes, efi::OPEN_PROTOCOL_GET_PROTOCOL);
+          let hid_io = MaybeUninit::<hid_io::protocol::Protocol>::zeroed();
+          let mut hid_io = hid_io.assume_init();
+          hid_io.set_report = mock_set_report;
+          // note: this will leak a hid_io instance
+          interface.write(Box::into_raw(Box::new(hid_io)) as *mut c_void);
+        }
+        efi::Status::SUCCESS
+      });
 
       let agent = 0x1 as efi::Handle;
       let mut keyboard_handler = KeyboardHidHandler::new(boot_services, agent);
@@ -1684,14 +1720,14 @@ mod test {
         simple_text_in: protocols::simple_text_input::Protocol {
           reset: simple_text_in_reset,
           read_key_stroke: simple_text_in_read_key_stroke,
-          wait_for_key: core::ptr::null_mut()
+          wait_for_key: core::ptr::null_mut(),
         },
         boot_services,
-        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
       };
 
       let mut hid_io = MockHidIo::new();
-      hid_io.expect_set_output_report().returning(|_,_|Ok(()));
+      hid_io.expect_set_output_report().returning(|_, _| Ok(()));
 
       //buffer CapsLock + a, b, c
       let report: &[u8] = &[0x00, 0x00, 0x39, 0x04, 0x04, 0x05, 0x00, 0x00];
@@ -1720,14 +1756,14 @@ mod test {
           set_state: simple_text_in_ex_set_state,
           register_key_notify: simple_text_in_ex_register_key_notify,
           unregister_key_notify: simple_text_in_ex_unregister_key_notify,
-          wait_for_key_ex: core::ptr::null_mut()
+          wait_for_key_ex: core::ptr::null_mut(),
         },
         boot_services,
-        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
       };
 
       let mut hid_io = MockHidIo::new();
-      hid_io.expect_set_output_report().returning(|_,_|Ok(()));
+      hid_io.expect_set_output_report().returning(|_, _| Ok(()));
 
       //buffer CapsLock + a, b, c
       let report: &[u8] = &[0x00, 0x00, 0x39, 0x04, 0x04, 0x05, 0x00, 0x00];
@@ -1737,7 +1773,7 @@ mod test {
       let prev_led_state = keyboard_handler.led_state.clone();
       assert!(!keyboard_handler.last_keys.is_empty());
 
-    let this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input_ex::Protocol;
+      let this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input_ex::Protocol;
       let status = simple_text_in_ex_reset(this_ptr, efi::Boolean::from(false));
       assert_eq!(status, efi::Status::SUCCESS);
       assert!(keyboard_handler.key_queue.peek_key().is_none());
@@ -1783,10 +1819,10 @@ mod test {
         simple_text_in: protocols::simple_text_input::Protocol {
           reset: simple_text_in_reset,
           read_key_stroke: simple_text_in_read_key_stroke,
-          wait_for_key: core::ptr::null_mut()
+          wait_for_key: core::ptr::null_mut(),
         },
         boot_services,
-        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
       };
 
       let context_ex = SimpleTextInExContext {
@@ -1796,10 +1832,10 @@ mod test {
           set_state: simple_text_in_ex_set_state,
           register_key_notify: simple_text_in_ex_register_key_notify,
           unregister_key_notify: simple_text_in_ex_unregister_key_notify,
-          wait_for_key_ex: core::ptr::null_mut()
+          wait_for_key_ex: core::ptr::null_mut(),
         },
         boot_services,
-        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
       };
 
       let simple_this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input::Protocol;
@@ -1816,36 +1852,54 @@ mod test {
       keyboard_handler.receive_report(report, &hid_io);
 
       //read with simple_text_in
-      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status =
+        simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 'c' as u16);
       assert_eq!(key_data.scan_code, 0);
 
       //read with simple_text_in_ex
-      let status = simple_text_in_ex_read_key_stroke(simple_ex_this_ptr, &mut key_data_ex as *mut protocols::simple_text_input_ex::KeyData);
+      let status = simple_text_in_ex_read_key_stroke(
+        simple_ex_this_ptr,
+        &mut key_data_ex as *mut protocols::simple_text_input_ex::KeyData,
+      );
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data_ex.key.unicode_char, 'b' as u16);
       assert_eq!(key_data_ex.key.scan_code, 0);
       assert_eq!(key_data_ex.key_state.key_shift_state, protocols::simple_text_input_ex::SHIFT_STATE_VALID);
-      assert_eq!(key_data_ex.key_state.key_toggle_state, protocols::simple_text_input_ex::TOGGLE_STATE_VALID | protocols::simple_text_input_ex::KEY_STATE_EXPOSED);
+      assert_eq!(
+        key_data_ex.key_state.key_toggle_state,
+        protocols::simple_text_input_ex::TOGGLE_STATE_VALID | protocols::simple_text_input_ex::KEY_STATE_EXPOSED
+      );
 
       //read again with simple_text_in
-      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status =
+        simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 'a' as u16);
       assert_eq!(key_data.scan_code, 0);
 
       //read with empty queue with simple_text_in
-      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status =
+        simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::NOT_READY);
 
       //read with empty queue with simple_text_in_ex
-      let status = simple_text_in_ex_read_key_stroke(simple_ex_this_ptr, &mut key_data_ex as *mut protocols::simple_text_input_ex::KeyData);
+      let status = simple_text_in_ex_read_key_stroke(
+        simple_ex_this_ptr,
+        &mut key_data_ex as *mut protocols::simple_text_input_ex::KeyData,
+      );
       assert_eq!(status, efi::Status::NOT_READY);
       assert_eq!(key_data_ex.key.unicode_char, 0);
       assert_eq!(key_data_ex.key.scan_code, 0);
-      assert_eq!(key_data_ex.key_state.key_shift_state, protocols::simple_text_input_ex::SHIFT_STATE_VALID | protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED);
-      assert_eq!(key_data_ex.key_state.key_toggle_state, protocols::simple_text_input_ex::TOGGLE_STATE_VALID | protocols::simple_text_input_ex::KEY_STATE_EXPOSED);
+      assert_eq!(
+        key_data_ex.key_state.key_shift_state,
+        protocols::simple_text_input_ex::SHIFT_STATE_VALID | protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED
+      );
+      assert_eq!(
+        key_data_ex.key_state.key_toggle_state,
+        protocols::simple_text_input_ex::TOGGLE_STATE_VALID | protocols::simple_text_input_ex::KEY_STATE_EXPOSED
+      );
 
       //send ctrl-a - expect it to be switched to control-character 0x01
       let report: &[u8] = &[0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -1853,7 +1907,8 @@ mod test {
       //release keys
       let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
       keyboard_handler.receive_report(report, &hid_io);
-      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status =
+        simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 0x1);
       assert_eq!(key_data.scan_code, 0);
@@ -1864,7 +1919,8 @@ mod test {
       //release keys
       let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
       keyboard_handler.receive_report(report, &hid_io);
-      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status =
+        simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 0x1a);
       assert_eq!(key_data.scan_code, 0);
@@ -1890,13 +1946,103 @@ mod test {
       keyboard_handler.receive_report(report, &hid_io);
 
       // should get only the 'a', partial keystroke should be dropped.
-      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status =
+        simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 'a' as u16);
       assert_eq!(key_data.scan_code, 0);
 
-      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status =
+        simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::NOT_READY);
+    }
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn wait_for_key_should_wait_for_key() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    {
+      const WAIT_FOR_KEY_EVENT: efi::Event = 0x15 as efi::Event;
+      static mut KEY_HANDLER_PTR: *mut KeyboardHidHandler = core::ptr::null_mut();
+      static mut START: SystemTime = UNIX_EPOCH;
+      const WAIT_TIME_IN_MS: u128 = 200;
+      static mut RECEIVED_EVENT: bool = false;
+
+      boot_services.expect_raise_tpl().returning(|_| efi::TPL_APPLICATION);
+      boot_services.expect_restore_tpl().returning(|_| ());
+      boot_services.expect_signal_event().returning(|_| efi::Status::SUCCESS);
+
+      let agent = 0x1 as efi::Handle;
+      let mut keyboard_handler = KeyboardHidHandler::new(boot_services, agent);
+      let descriptor = hidparser::parse_report_descriptor(&BOOT_KEYBOARD_REPORT_DESCRIPTOR).unwrap();
+      keyboard_handler.process_descriptor(descriptor).unwrap();
+      keyboard_handler.key_queue.set_layout(Some(hii_keyboard_layout::get_default_keyboard_layout()));
+
+      unsafe { KEY_HANDLER_PTR = &mut keyboard_handler as *mut KeyboardHidHandler };
+
+      // use a separate boot services instance for the actuall event callback - this allows
+      // for different expectations on boot_services for the event callback and other functionality
+      // (e.g. the receive_report call in the restore_tpl expectation below will use the expectations
+      // from boot_services, not from context_boot services).
+      let mut context_boot_services = MockUefiBootServices::new();
+      context_boot_services.expect_raise_tpl().returning(|_| efi::TPL_APPLICATION);
+      context_boot_services.expect_restore_tpl().returning(|_| {
+        // In a real scenario, reports will be received as part of event callback that occurs at the end of
+        // boot_services::restore_tpl. So here we just fake it by directly invoking the receive after a certain
+        // amount of time has elapsed.
+        let now = SystemTime::now();
+        unsafe {
+          if now.duration_since(START).unwrap().as_millis() > WAIT_TIME_IN_MS {
+            START = now;
+            // press and release the 'a' key
+            let hid_io = MockHidIo::new();
+            let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+            (*KEY_HANDLER_PTR).receive_report(report, &hid_io);
+            let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            (*KEY_HANDLER_PTR).receive_report(report, &hid_io);
+          }
+        }
+      });
+
+      context_boot_services.expect_signal_event().returning(|event| {
+        if event == WAIT_FOR_KEY_EVENT {
+          unsafe {
+            assert!(!RECEIVED_EVENT);
+            RECEIVED_EVENT = true
+          };
+        }
+        efi::Status::SUCCESS
+      });
+
+      let context_boot_services_ptr = Box::into_raw(Box::new(context_boot_services));
+      let context_boot_services = unsafe { context_boot_services_ptr.as_mut().unwrap() };
+      {
+        // build a simple text in context
+        let mut context = SimpleTextInContext {
+          simple_text_in: protocols::simple_text_input::Protocol {
+            reset: simple_text_in_reset,
+            read_key_stroke: simple_text_in_read_key_stroke,
+            wait_for_key: WAIT_FOR_KEY_EVENT,
+          },
+          boot_services: context_boot_services,
+          keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
+        };
+        let context_ptr = &mut context as *mut SimpleTextInContext as *mut c_void;
+
+        unsafe { START = SystemTime::now() };
+        simple_text_in_wait_for_key(WAIT_FOR_KEY_EVENT, context_ptr);
+        assert!(keyboard_handler.key_queue.peek_key().is_some());
+        assert!(unsafe { RECEIVED_EVENT });
+      }
+      // drop the second faux static boot service
+      unsafe { drop(Box::from_raw(context_boot_services_ptr)) };
     }
 
     //drop the faux static boot services.
