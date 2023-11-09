@@ -927,10 +927,33 @@ extern "efiapi" fn simple_text_in_ex_reset(
 
 // reads a key stroke - part of the simple_text_in_ex protocol interface.
 extern "efiapi" fn simple_text_in_ex_read_key_stroke(
-  _this: *mut protocols::simple_text_input_ex::Protocol,
-  _key_data: *mut protocols::simple_text_input_ex::KeyData,
+  this: *mut protocols::simple_text_input_ex::Protocol,
+  key_data: *mut protocols::simple_text_input_ex::KeyData,
 ) -> efi::Status {
-  todo!();
+  if this.is_null() || key_data.is_null() {
+    return efi::Status::INVALID_PARAMETER;
+  }
+  let context = unsafe {(this as *mut SimpleTextInExContext).as_mut()}.expect("bad pointer");
+  let mut status = efi::Status::SUCCESS;
+  let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+  'read_key_stroke: {
+    let keyboard_handler = unsafe {context.keyboard_handler.as_mut()};
+    if let Some(keyboard_handler) = keyboard_handler {
+      if let Some(key) = keyboard_handler.key_queue.pop_key() {
+        unsafe {key_data.write(key)}
+      } else {
+        let mut key: protocols::simple_text_input_ex::KeyData = Default::default();
+        key.key_state = keyboard_handler.key_queue.init_key_state();
+        unsafe {key_data.write(key)};
+        status = efi::Status::NOT_READY
+      }
+    } else {
+      status = efi::Status::DEVICE_ERROR;
+      break 'read_key_stroke;
+    }
+  }
+  context.boot_services.restore_tpl(old_tpl);
+  status
 }
 
 // sets the keyboard state - part of the simple_text_in_ex protocol interface.
@@ -1750,15 +1773,10 @@ mod test {
       keyboard_handler.process_descriptor(descriptor).unwrap();
       keyboard_handler.key_queue.set_layout(Some(hii_keyboard_layout::get_default_keyboard_layout()));
 
-      let hid_io = MockHidIo::new();
+      // enable partial keystrokes
+      keyboard_handler.key_queue.set_key_toggle_state(protocols::simple_text_input_ex::KEY_STATE_EXPOSED);
 
-      //send 'a', 'b', 'c'. Simultaneous key stroke ordering is not defined by spec, but this implementation processes
-      //them in descending usage code order, so 'c', 'b', 'a'.
-      let report: &[u8] = &[0x00, 0x00, 0x04, 0x05, 0x06, 0x00, 0x00, 0x00];
-      keyboard_handler.receive_report(report, &hid_io);
-      //release keys
-      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-      keyboard_handler.receive_report(report, &hid_io);
+      let hid_io = MockHidIo::new();
 
       // build a simple text in context
       let context = SimpleTextInContext {
@@ -1771,25 +1789,63 @@ mod test {
         keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
       };
 
-      let this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input::Protocol;
+      let context_ex = SimpleTextInExContext {
+        simple_text_in_ex: protocols::simple_text_input_ex::Protocol {
+          reset: simple_text_in_ex_reset,
+          read_key_stroke_ex: simple_text_in_ex_read_key_stroke,
+          set_state: simple_text_in_ex_set_state,
+          register_key_notify: simple_text_in_ex_register_key_notify,
+          unregister_key_notify: simple_text_in_ex_unregister_key_notify,
+          wait_for_key_ex: core::ptr::null_mut()
+        },
+        boot_services,
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler
+      };
+
+      let simple_this_ptr = Box::into_raw(Box::new(context)) as *mut protocols::simple_text_input::Protocol;
+      let simple_ex_this_ptr = Box::into_raw(Box::new(context_ex)) as *mut protocols::simple_text_input_ex::Protocol;
       let mut key_data: protocols::simple_text_input::InputKey = Default::default();
-      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let mut key_data_ex: protocols::simple_text_input_ex::KeyData = Default::default();
+
+      //send 'a', 'b', 'c'. Simultaneous key stroke ordering is not defined by spec, but this implementation processes
+      //them in descending usage code order, so 'c', 'b', 'a'.
+      let report: &[u8] = &[0x00, 0x00, 0x04, 0x05, 0x06, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      //release keys and push ctrl
+      let report: &[u8] = &[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      //read with simple_text_in
+      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 'c' as u16);
       assert_eq!(key_data.scan_code, 0);
 
-      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      //read with simple_text_in_ex
+      let status = simple_text_in_ex_read_key_stroke(simple_ex_this_ptr, &mut key_data_ex as *mut protocols::simple_text_input_ex::KeyData);
       assert_eq!(status, efi::Status::SUCCESS);
-      assert_eq!(key_data.unicode_char, 'b' as u16);
-      assert_eq!(key_data.scan_code, 0);
+      assert_eq!(key_data_ex.key.unicode_char, 'b' as u16);
+      assert_eq!(key_data_ex.key.scan_code, 0);
+      assert_eq!(key_data_ex.key_state.key_shift_state, protocols::simple_text_input_ex::SHIFT_STATE_VALID);
+      assert_eq!(key_data_ex.key_state.key_toggle_state, protocols::simple_text_input_ex::TOGGLE_STATE_VALID | protocols::simple_text_input_ex::KEY_STATE_EXPOSED);
 
-      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      //read again with simple_text_in
+      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 'a' as u16);
       assert_eq!(key_data.scan_code, 0);
 
-      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      //read with empty queue with simple_text_in
+      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::NOT_READY);
+
+      //read with empty queue with simple_text_in_ex
+      let status = simple_text_in_ex_read_key_stroke(simple_ex_this_ptr, &mut key_data_ex as *mut protocols::simple_text_input_ex::KeyData);
+      assert_eq!(status, efi::Status::NOT_READY);
+      assert_eq!(key_data_ex.key.unicode_char, 0);
+      assert_eq!(key_data_ex.key.scan_code, 0);
+      assert_eq!(key_data_ex.key_state.key_shift_state, protocols::simple_text_input_ex::SHIFT_STATE_VALID | protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED);
+      assert_eq!(key_data_ex.key_state.key_toggle_state, protocols::simple_text_input_ex::TOGGLE_STATE_VALID | protocols::simple_text_input_ex::KEY_STATE_EXPOSED);
 
       //send ctrl-a - expect it to be switched to control-character 0x01
       let report: &[u8] = &[0x01, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -1797,7 +1853,7 @@ mod test {
       //release keys
       let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
       keyboard_handler.receive_report(report, &hid_io);
-      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 0x1);
       assert_eq!(key_data.scan_code, 0);
@@ -1808,13 +1864,10 @@ mod test {
       //release keys
       let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
       keyboard_handler.receive_report(report, &hid_io);
-      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 0x1a);
       assert_eq!(key_data.scan_code, 0);
-
-      // enable partial keystrokes
-      keyboard_handler.key_queue.set_key_toggle_state(protocols::simple_text_input_ex::KEY_STATE_EXPOSED);
 
       // press the right logo key
       let report: &[u8] = &[0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -1837,12 +1890,12 @@ mod test {
       keyboard_handler.receive_report(report, &hid_io);
 
       // should get only the 'a', partial keystroke should be dropped.
-      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(key_data.unicode_char, 'a' as u16);
       assert_eq!(key_data.scan_code, 0);
 
-      let status = simple_text_in_read_key_stroke(this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
+      let status = simple_text_in_read_key_stroke(simple_this_ptr, &mut key_data as *mut protocols::simple_text_input::InputKey);
       assert_eq!(status, efi::Status::NOT_READY);
     }
 
