@@ -664,25 +664,29 @@ impl KeyboardHidHandler {
     self.current_keys.clear();
     self.key_queue.reset(extended_verification.into());
     if extended_verification {
-      let controller = self.controller.expect("keyboard handler not initialized");
-      // For simplicity, UefiHidIoFactory is used directly here to get a hid_io instance to send an LED report.
-      // This avoids having to manage a hid_io or hid_io_factory trait object reference on self.
-      let hid_factory = UefiHidIoFactory::new(self.boot_services, self.agent);
-      let hid_io = hid_factory.new_hid_io(controller, false);
-      if let Ok(hid_io) = hid_io {
-        for (id, output_report) in self.generate_led_output_reports() {
-          let result = hid_io.set_output_report(id.map(|x| u32::from(x) as u8), &output_report);
-          if let Err(result) = result {
-            #[cfg(not(test))]
-            debugln!(DEBUG_ERROR, "unexpected error sending output report: {:?}", result);
-            return Err(efi::Status::DEVICE_ERROR);
-          }
+      self.update_leds()?;
+    }
+    Ok(())
+  }
+  fn update_leds(&mut self) -> Result<(), efi::Status> {
+    let controller = self.controller.expect("keyboard handler not initialized");
+    // For simplicity, UefiHidIoFactory is used directly here to get a hid_io instance to send an LED report.
+    // This avoids having to manage a hid_io or hid_io_factory trait object reference on self.
+    let hid_factory = UefiHidIoFactory::new(self.boot_services, self.agent);
+    let hid_io = hid_factory.new_hid_io(controller, false);
+    if let Ok(hid_io) = hid_io {
+      for (id, output_report) in self.generate_led_output_reports() {
+        let result = hid_io.set_output_report(id.map(|x| u32::from(x) as u8), &output_report);
+        if let Err(result) = result {
+          #[cfg(not(test))]
+          debugln!(DEBUG_ERROR, "unexpected error sending output report: {:?}", result);
+          return Err(efi::Status::DEVICE_ERROR);
         }
-      } else {
-        #[cfg(not(test))]
-        debugln!(DEBUG_ERROR, "simple_text_in_reset: failed to get an instance of hid_io for LED reset.");
-        return Err(efi::Status::DEVICE_ERROR);
       }
+    } else {
+      #[cfg(not(test))]
+      debugln!(DEBUG_ERROR, "update_leds: failed to get an instance of hid_io for LED reset.");
+      return Err(efi::Status::DEVICE_ERROR);
     }
     Ok(())
   }
@@ -985,10 +989,26 @@ extern "efiapi" fn simple_text_in_ex_read_key_stroke(
 
 // sets the keyboard state - part of the simple_text_in_ex protocol interface.
 extern "efiapi" fn simple_text_in_ex_set_state(
-  _this: *mut protocols::simple_text_input_ex::Protocol,
-  _key_toggle_state: *mut protocols::simple_text_input_ex::KeyToggleState,
+  this: *mut protocols::simple_text_input_ex::Protocol,
+  key_toggle_state: *mut protocols::simple_text_input_ex::KeyToggleState,
 ) -> efi::Status {
-  todo!();
+  if this.is_null() || key_toggle_state.is_null() {
+    return efi::Status::INVALID_PARAMETER;
+  }
+  let context = unsafe { (this as *mut SimpleTextInExContext).as_mut() }.expect("bad pointer");
+  let mut status = efi::Status::SUCCESS;
+  let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+  '_set_state_processing: {
+    if let Some(keyboard_handler) = unsafe { context.keyboard_handler.as_mut() } {
+      keyboard_handler.key_queue.set_key_toggle_state(unsafe { key_toggle_state.read() });
+      let result = keyboard_handler.update_leds();
+      if let Err(result) = result {
+        status = result;
+      }
+    }
+  }
+  context.boot_services.restore_tpl(old_tpl);
+  status
 }
 
 // registers a key notification callback function - part of the simple_text_in_ex protocol interface.
@@ -1102,10 +1122,8 @@ mod test {
     ffi::c_void,
     mem::MaybeUninit,
     slice::from_raw_parts_mut,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
   };
-  use std::time::{Instant, SystemTime, UNIX_EPOCH};
+  use std::time::{SystemTime, UNIX_EPOCH};
 
   use hii_keyboard_layout::{self, HiiKeyboardLayout};
   use r_efi::{
@@ -2043,6 +2061,78 @@ mod test {
       }
       // drop the second faux static boot service
       unsafe { drop(Box::from_raw(context_boot_services_ptr)) };
+    }
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn set_state_should_set_state() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    {
+      boot_services.expect_raise_tpl().returning(|_| efi::TPL_APPLICATION);
+      boot_services.expect_restore_tpl().returning(|_| ());
+      boot_services.expect_signal_event().returning(|_| efi::Status::SUCCESS);
+
+      extern "efiapi" fn mock_set_report(
+        _this: *const hid_io::protocol::Protocol,
+        _report_id: u8,
+        _report_type: hid_io::protocol::HidReportType,
+        _report_buffer_size: usize,
+        _report_buffer: *mut c_void,
+      ) -> efi::Status {
+        efi::Status::SUCCESS
+      }
+
+      boot_services.expect_open_protocol().returning(|_, protocol, interface, _, _, attributes| {
+        unsafe {
+          assert_eq!(protocol.read(), hid_io::protocol::GUID);
+          assert_eq!(attributes, efi::OPEN_PROTOCOL_GET_PROTOCOL);
+          let hid_io = MaybeUninit::<hid_io::protocol::Protocol>::zeroed();
+          let mut hid_io = hid_io.assume_init();
+          hid_io.set_report = mock_set_report;
+          // note: this will leak a hid_io instance
+          interface.write(Box::into_raw(Box::new(hid_io)) as *mut c_void);
+        }
+        efi::Status::SUCCESS
+      });
+
+      let agent = 0x1 as efi::Handle;
+      let mut keyboard_handler = KeyboardHidHandler::new(boot_services, agent);
+      let descriptor = hidparser::parse_report_descriptor(&BOOT_KEYBOARD_REPORT_DESCRIPTOR).unwrap();
+      keyboard_handler.process_descriptor(descriptor).unwrap();
+      keyboard_handler.key_queue.set_layout(Some(hii_keyboard_layout::get_default_keyboard_layout()));
+      keyboard_handler.controller = Some(0x2 as efi::Handle);
+
+      let context_ex = SimpleTextInExContext {
+        simple_text_in_ex: protocols::simple_text_input_ex::Protocol {
+          reset: simple_text_in_ex_reset,
+          read_key_stroke_ex: simple_text_in_ex_read_key_stroke,
+          set_state: simple_text_in_ex_set_state,
+          register_key_notify: simple_text_in_ex_register_key_notify,
+          unregister_key_notify: simple_text_in_ex_unregister_key_notify,
+          wait_for_key_ex: core::ptr::null_mut(),
+        },
+        boot_services,
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
+      };
+
+      let context_ex_ptr = Box::into_raw(Box::new(context_ex));
+
+      let mut key_toggle_state = protocols::simple_text_input_ex::KEY_STATE_EXPOSED;
+      let status = simple_text_in_ex_set_state(
+        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol, 
+        core::ptr::addr_of_mut!(key_toggle_state));
+
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_ne!(keyboard_handler.key_queue.init_key_state().key_toggle_state & protocols::simple_text_input_ex::KEY_STATE_EXPOSED, 0);
+
+      keyboard_handler.controller = None;
     }
 
     //drop the faux static boot services.
