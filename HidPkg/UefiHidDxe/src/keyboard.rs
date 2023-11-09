@@ -680,7 +680,7 @@ impl KeyboardHidHandler {
         if let Err(result) = result {
           #[cfg(not(test))]
           debugln!(DEBUG_ERROR, "unexpected error sending output report: {:?}", result);
-          return Err(efi::Status::DEVICE_ERROR);
+          return Err(result);
         }
       }
     } else {
@@ -789,6 +789,7 @@ impl HidReportReciever for KeyboardHidHandler {
       if let Err(result) = result {
         #[cfg(not(test))]
         debugln!(DEBUG_ERROR, "unexpected error sending output report: {:?}", result);
+        let _ = result;
       }
     }
   }
@@ -853,7 +854,7 @@ extern "efiapi" fn simple_text_in_read_key_stroke(
     return efi::Status::INVALID_PARAMETER;
   }
   let context = unsafe { (this as *mut SimpleTextInContext).as_mut() }.expect("bad pointer");
-  let mut status = efi::Status::SUCCESS;
+  let status;
   let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
   'read_key_stroke: {
     let keyboard_handler = unsafe { context.keyboard_handler.as_mut() };
@@ -1030,8 +1031,36 @@ extern "efiapi" fn simple_text_in_ex_unregister_key_notify(
 }
 
 // Event handler function for the wait_for_key_event
-extern "efiapi" fn simple_text_in_ex_wait_for_key(_event: efi::Event, _context: *mut c_void) {
-  todo!()
+extern "efiapi" fn simple_text_in_ex_wait_for_key(event: efi::Event, context: *mut c_void) {
+  if context.is_null() {
+    #[cfg(not(test))]
+    debugln!(DEBUG_ERROR, "simple_text_in_ex_wait_for_key invoked with invalid context");
+    return;
+  }
+  let context = unsafe { (context as *mut SimpleTextInExContext).as_mut() }.expect("bad pointer");
+  let mut wait_complete: bool = false;
+  while !wait_complete {
+    let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+    {
+      if let Some(keyboard_handler) = unsafe { context.keyboard_handler.as_mut() } {
+        while let Some(key_data) = keyboard_handler.key_queue.peek_key() {
+          if key_data.key.unicode_char == 0 && key_data.key.scan_code == 0 {
+            // consume (and ignore) the partial stroke.
+            let _ = keyboard_handler.key_queue.pop_key();
+            continue;
+          } else {
+            // valid keystroke
+            context.boot_services.signal_event(event);
+            wait_complete = true;
+            break;
+          }
+        }
+      } else {
+        wait_complete = true;
+      }
+    }
+    context.boot_services.restore_tpl(old_tpl);
+  }
 }
 
 // Event callback function for handling registered key notifications. Iterates over the queue of keys to be notified,
@@ -1118,11 +1147,7 @@ extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut c_void) {
 
 #[cfg(test)]
 mod test {
-  use core::{
-    ffi::c_void,
-    mem::MaybeUninit,
-    slice::from_raw_parts_mut,
-  };
+  use core::{ffi::c_void, mem::MaybeUninit, slice::from_raw_parts_mut};
   use std::time::{SystemTime, UNIX_EPOCH};
 
   use hii_keyboard_layout::{self, HiiKeyboardLayout};
@@ -2043,7 +2068,7 @@ mod test {
       let context_boot_services = unsafe { context_boot_services_ptr.as_mut().unwrap() };
       {
         // build a simple text in context
-        let mut context = SimpleTextInContext {
+        let context = SimpleTextInContext {
           simple_text_in: protocols::simple_text_input::Protocol {
             reset: simple_text_in_reset,
             read_key_stroke: simple_text_in_read_key_stroke,
@@ -2052,12 +2077,41 @@ mod test {
           boot_services: context_boot_services,
           keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
         };
-        let context_ptr = &mut context as *mut SimpleTextInContext as *mut c_void;
+        let context_ptr = Box::into_raw(Box::new(context)) as *mut c_void;
 
         unsafe { START = SystemTime::now() };
+        assert!(keyboard_handler.key_queue.peek_key().is_none());
         simple_text_in_wait_for_key(WAIT_FOR_KEY_EVENT, context_ptr);
         assert!(keyboard_handler.key_queue.peek_key().is_some());
         assert!(unsafe { RECEIVED_EVENT });
+
+        drop(unsafe { Box::from_raw(context_ptr) });
+
+        keyboard_handler.reset(false).unwrap();
+
+        // build a simple text in context
+        let context_ex = SimpleTextInExContext {
+          simple_text_in_ex: protocols::simple_text_input_ex::Protocol {
+            reset: simple_text_in_ex_reset,
+            read_key_stroke_ex: simple_text_in_ex_read_key_stroke,
+            set_state: simple_text_in_ex_set_state,
+            register_key_notify: simple_text_in_ex_register_key_notify,
+            unregister_key_notify: simple_text_in_ex_unregister_key_notify,
+            wait_for_key_ex: core::ptr::null_mut(),
+          },
+          boot_services: context_boot_services,
+          keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
+        };
+        let context_ptr = Box::into_raw(Box::new(context_ex)) as *mut c_void;
+
+        unsafe { RECEIVED_EVENT = false };
+        unsafe { START = SystemTime::now() };
+        assert!(keyboard_handler.key_queue.peek_key().is_none());
+        simple_text_in_ex_wait_for_key(WAIT_FOR_KEY_EVENT, context_ptr);
+        assert!(keyboard_handler.key_queue.peek_key().is_some());
+        assert!(unsafe { RECEIVED_EVENT });
+
+        drop(unsafe { Box::from_raw(context_ptr) });
       }
       // drop the second faux static boot service
       unsafe { drop(Box::from_raw(context_boot_services_ptr)) };
@@ -2126,11 +2180,16 @@ mod test {
 
       let mut key_toggle_state = protocols::simple_text_input_ex::KEY_STATE_EXPOSED;
       let status = simple_text_in_ex_set_state(
-        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol, 
-        core::ptr::addr_of_mut!(key_toggle_state));
+        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol,
+        core::ptr::addr_of_mut!(key_toggle_state),
+      );
 
       assert_eq!(status, efi::Status::SUCCESS);
-      assert_ne!(keyboard_handler.key_queue.init_key_state().key_toggle_state & protocols::simple_text_input_ex::KEY_STATE_EXPOSED, 0);
+      assert_ne!(
+        keyboard_handler.key_queue.init_key_state().key_toggle_state
+          & protocols::simple_text_input_ex::KEY_STATE_EXPOSED,
+        0
+      );
 
       keyboard_handler.controller = None;
     }
