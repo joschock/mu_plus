@@ -12,7 +12,7 @@ use core::{ffi::c_void, slice::from_raw_parts};
 use alloc::{boxed::Box, vec};
 
 use r_efi::{efi, protocols::driver_binding, system};
-use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR, DEBUG_WARN};
+use rust_advanced_logger_dxe::{debugln, DEBUG_ERROR, DEBUG_WARN, DEBUG_INFO};
 
 use crate::{keyboard, keyboard::KeyboardContext, pointer, pointer::PointerContext, BOOT_SERVICES};
 
@@ -98,7 +98,9 @@ pub fn initialize(controller: efi::Handle, driver_binding: &driver_binding::Prot
     debugln!(DEBUG_WARN, "[hid::initialize] no devices supported");
     //no devices supported.
     let _ = release_hid_io(controller, driver_binding);
+    debugln!(DEBUG_INFO, "[hid::initialize] line: {:?}", line!());
     unsafe { drop(Box::from_raw(hid_context_ptr)) };
+    debugln!(DEBUG_INFO, "[hid::initialize] line: {:?}", line!());
     Err(efi::Status::UNSUPPORTED)?;
   }
 
@@ -179,7 +181,7 @@ fn release_hid_io(controller: efi::Handle, driver_binding: &driver_binding::Prot
   // Safety: BOOT_SERVICES must have been initialized to point to the UEFI Boot Services table.
   // Caller should have ensured this, so just expect on failure.
   let boot_services = unsafe { BOOT_SERVICES.as_mut().expect("BOOT_SERVICES not properly initialized") };
-
+  debugln!(DEBUG_INFO, "[hid::initialize] line: {:?}", line!());
   // release HidIo
   match (boot_services.close_protocol)(
     controller,
@@ -187,13 +189,13 @@ fn release_hid_io(controller: efi::Handle, driver_binding: &driver_binding::Prot
     driver_binding.driver_binding_handle,
     controller,
   ) {
-    efi::Status::SUCCESS => (),
+    efi::Status::SUCCESS => debugln!(DEBUG_INFO, "[hid::initialize] line: {:?}", line!()),
     err => {
       debugln!(DEBUG_ERROR, "[hid::release_hid_io] unexpected error from boot_services.close_protocol: {:?}", err);
       return Err(efi::Status::DEVICE_ERROR);
     }
   }
-
+  debugln!(DEBUG_INFO, "[hid::initialize] line: {:?}", line!());
   Ok(())
 }
 
