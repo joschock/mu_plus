@@ -1047,7 +1047,7 @@ extern "efiapi" fn simple_text_in_ex_register_key_notify(
         .notification_callbacks
         .insert(keyboard_handler.next_notify_handle, (key_data.clone(), key_notification_function));
       keyboard_handler.key_queue.add_notify_key(key_data);
-      unsafe { notify_handle.write(keyboard_handler.next_notify_handle as *mut c_void)};
+      unsafe { notify_handle.write(keyboard_handler.next_notify_handle as *mut c_void) };
       status = efi::Status::SUCCESS;
     } else {
       status = efi::Status::DEVICE_ERROR;
@@ -1059,10 +1059,31 @@ extern "efiapi" fn simple_text_in_ex_register_key_notify(
 
 // unregisters a key notification callback function - part of the simple_text_in_ex protocol interface.
 extern "efiapi" fn simple_text_in_ex_unregister_key_notify(
-  _this: *mut protocols::simple_text_input_ex::Protocol,
-  _notification_handle: *mut c_void,
+  this: *mut protocols::simple_text_input_ex::Protocol,
+  notification_handle: *mut c_void,
 ) -> efi::Status {
-  todo!();
+  if this.is_null() {
+    return efi::Status::INVALID_PARAMETER;
+  }
+  let status;
+  let context = unsafe { (this as *mut SimpleTextInExContext).as_mut() }.expect("bad pointer");
+  let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+  if let Some(keyboard_handler) = unsafe { context.keyboard_handler.as_mut() } {
+    if let Some(entry) = keyboard_handler.notification_callbacks.remove(&(notification_handle as usize)) {
+      let removed_key = entry.0;
+      if !keyboard_handler.notification_callbacks.values().any(|(key, _)| *key == removed_key) {
+        // no other handlers exist for the key in the removed entry, so remove it from the key queue as well.
+        keyboard_handler.key_queue.remove_notify_key(&removed_key);
+      }
+      status = efi::Status::SUCCESS;
+    } else {
+      status = efi::Status::INVALID_PARAMETER;
+    }
+  } else {
+    status = efi::Status::DEVICE_ERROR;
+  }
+  context.boot_services.restore_tpl(old_tpl);
+  status
 }
 
 // Event handler function for the wait_for_key_event
@@ -1226,11 +1247,12 @@ mod test {
   use crate::{
     boot_services::MockUefiBootServices,
     hid_io::{HidReportReciever, MockHidIo},
+    key_queue::OrdKeyData,
     keyboard::{
       on_layout_update, process_key_notifies, simple_text_in_ex_read_key_stroke, simple_text_in_ex_register_key_notify,
       simple_text_in_ex_reset, simple_text_in_ex_set_state, simple_text_in_ex_unregister_key_notify,
       simple_text_in_ex_wait_for_key, simple_text_in_wait_for_key, KeyboardHidHandler, SimpleTextInExContext,
-    }, key_queue::OrdKeyData,
+    },
   };
 
   use super::{simple_text_in_read_key_stroke, simple_text_in_reset, LayoutChangeContext, SimpleTextInContext};
@@ -2275,21 +2297,30 @@ mod test {
       const NOTIFY_EVENT: efi::Event = 0x1 as efi::Event;
       static mut SIMPLE_TEXT_IN_EX_CTX_PTR: *mut c_void = core::ptr::null_mut();
       static mut KEY_NOTIFIED: bool = false;
+      static mut KEY2_NOTIFIED: bool = false;
 
       boot_services.expect_raise_tpl().returning(|_| efi::TPL_APPLICATION);
       boot_services.expect_restore_tpl().returning(|_| ());
-      boot_services.expect_signal_event()
-        .returning(|event| {
-          if event == NOTIFY_EVENT {
-            process_key_notifies(NOTIFY_EVENT, unsafe {SIMPLE_TEXT_IN_EX_CTX_PTR});            
-          }
-          efi::Status::SUCCESS
-        });
+      boot_services.expect_signal_event().returning(|event| {
+        if event == NOTIFY_EVENT {
+          process_key_notifies(NOTIFY_EVENT, unsafe { SIMPLE_TEXT_IN_EX_CTX_PTR });
+        }
+        efi::Status::SUCCESS
+      });
 
-      extern "efiapi" fn key_notify_callback (key_data: *mut protocols::simple_text_input_ex::KeyData) -> efi::Status {
-        let key = unsafe {key_data.read()};
+      extern "efiapi" fn key_notify_callback_a(key_data: *mut protocols::simple_text_input_ex::KeyData) -> efi::Status {
+        let key = unsafe { key_data.read() };
         assert_eq!(key.key.unicode_char, 'a' as u16);
-        unsafe {KEY_NOTIFIED = true};
+        unsafe { KEY_NOTIFIED = true };
+        efi::Status::SUCCESS
+      }
+
+      extern "efiapi" fn key_notify_callback_a_and_b(
+        key_data: *mut protocols::simple_text_input_ex::KeyData,
+      ) -> efi::Status {
+        let key = unsafe { key_data.read() };
+        assert!((key.key.unicode_char == 'a' as u16) || (key.key.unicode_char == 'b' as u16));
+        unsafe { KEY2_NOTIFIED = true };
         efi::Status::SUCCESS
       }
 
@@ -2316,18 +2347,19 @@ mod test {
       };
 
       let context_ex_ptr = Box::into_raw(Box::new(context_ex));
-      unsafe {SIMPLE_TEXT_IN_EX_CTX_PTR = context_ex_ptr as *mut c_void};
+      unsafe { SIMPLE_TEXT_IN_EX_CTX_PTR = context_ex_ptr as *mut c_void };
 
-      let mut key_data: protocols::simple_text_input_ex::KeyData = Default::default();  
+      let mut key_data: protocols::simple_text_input_ex::KeyData = Default::default();
       key_data.key.unicode_char = 'a' as u16;
 
       let mut notify_handle = core::ptr::null_mut();
 
-      let status = simple_text_in_ex_register_key_notify (
-        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol, 
-        &mut key_data as *mut protocols::simple_text_input_ex::KeyData, 
-        key_notify_callback, 
-        core::ptr::addr_of_mut!(notify_handle));
+      let status = simple_text_in_ex_register_key_notify(
+        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol,
+        &mut key_data as *mut protocols::simple_text_input_ex::KeyData,
+        key_notify_callback_a,
+        core::ptr::addr_of_mut!(notify_handle),
+      );
 
       assert_eq!(status, efi::Status::SUCCESS);
       assert_eq!(keyboard_handler.notification_callbacks.len(), 1);
@@ -2336,6 +2368,40 @@ mod test {
       assert_eq!(keyboard_handler.next_notify_handle, 1);
       assert_eq!(notify_handle as usize, 1);
 
+      key_data.key.unicode_char = 'a' as u16;
+      let mut notify_handle = core::ptr::null_mut();
+
+      let status = simple_text_in_ex_register_key_notify(
+        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol,
+        &mut key_data as *mut protocols::simple_text_input_ex::KeyData,
+        key_notify_callback_a_and_b,
+        core::ptr::addr_of_mut!(notify_handle),
+      );
+
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(keyboard_handler.notification_callbacks.len(), 2);
+      assert!(keyboard_handler.notification_callbacks.contains_key(&2));
+      assert_eq!(keyboard_handler.notification_callbacks.get(&2).unwrap().0, OrdKeyData(key_data));
+      assert_eq!(keyboard_handler.next_notify_handle, 2);
+      assert_eq!(notify_handle as usize, 2);
+
+      key_data.key.unicode_char = 'b' as u16;
+      let mut notify_handle = core::ptr::null_mut();
+
+      let status = simple_text_in_ex_register_key_notify(
+        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol,
+        &mut key_data as *mut protocols::simple_text_input_ex::KeyData,
+        key_notify_callback_a_and_b,
+        core::ptr::addr_of_mut!(notify_handle),
+      );
+
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(keyboard_handler.notification_callbacks.len(), 3);
+      assert!(keyboard_handler.notification_callbacks.contains_key(&3));
+      assert_eq!(keyboard_handler.notification_callbacks.get(&3).unwrap().0, OrdKeyData(key_data));
+      assert_eq!(keyboard_handler.next_notify_handle, 3);
+      assert_eq!(notify_handle as usize, 3);
+
       //send 'b'
       let report: &[u8] = &[0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00];
       keyboard_handler.receive_report(report, &hid_io);
@@ -2343,7 +2409,13 @@ mod test {
       //release
       let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
       keyboard_handler.receive_report(report, &hid_io);
-      assert!(!unsafe {KEY_NOTIFIED});
+      assert!(unsafe { KEY2_NOTIFIED });
+      assert!(!unsafe { KEY_NOTIFIED });
+
+      unsafe {
+        KEY2_NOTIFIED = false;
+        KEY_NOTIFIED = false;
+      }
 
       //send 'a'
       let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
@@ -2352,9 +2424,35 @@ mod test {
       //release
       let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
       keyboard_handler.receive_report(report, &hid_io);
-      assert!(unsafe {KEY_NOTIFIED});
+      assert!(unsafe { KEY2_NOTIFIED });
+      assert!(unsafe { KEY_NOTIFIED });
 
-      drop(unsafe{Box::from_raw(context_ex_ptr)});
+      //remove the 'a'-only callback
+      let status = simple_text_in_ex_unregister_key_notify(
+        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol,
+        1 as *mut c_void,
+      );
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(keyboard_handler.notification_callbacks.len(), 2);
+      assert!(!keyboard_handler.notification_callbacks.contains_key(&1));
+      assert_eq!(keyboard_handler.next_notify_handle, 3);
+
+      unsafe {
+        KEY2_NOTIFIED = false;
+        KEY_NOTIFIED = false;
+      }
+
+      //send 'a'
+      let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      //release
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      assert!(unsafe { KEY2_NOTIFIED });
+      assert!(!unsafe { KEY_NOTIFIED });
+
+      drop(unsafe { Box::from_raw(context_ex_ptr) });
     }
 
     //drop the faux static boot services.

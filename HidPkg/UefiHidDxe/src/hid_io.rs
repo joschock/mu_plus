@@ -29,7 +29,7 @@ pub trait HidIo {
 
 #[cfg_attr(test, automock)]
 pub trait HidIoFactory {
-  fn new_hid_io(&self, controller: efi::Handle, owned:bool) -> Result<Box<dyn HidIo>, efi::Status>;
+  fn new_hid_io(&self, controller: efi::Handle, owned: bool) -> Result<Box<dyn HidIo>, efi::Status>;
 }
 
 pub struct UefiHidIoFactory {
@@ -44,7 +44,7 @@ impl UefiHidIoFactory {
 }
 
 impl HidIoFactory for UefiHidIoFactory {
-  fn new_hid_io(&self, controller: efi::Handle, owned:bool) -> Result<Box<dyn HidIo>, efi::Status> {
+  fn new_hid_io(&self, controller: efi::Handle, owned: bool) -> Result<Box<dyn HidIo>, efi::Status> {
     let hid_io = UefiHidIo::new(self.boot_services, self.agent, controller, owned)?;
     Ok(Box::new(hid_io))
   }
@@ -56,7 +56,7 @@ pub struct UefiHidIo {
   controller: efi::Handle,
   agent: efi::Handle,
   receiver: Option<Box<dyn HidReportReciever>>,
-  owned: bool
+  owned: bool,
 }
 
 impl UefiHidIo {
@@ -64,7 +64,7 @@ impl UefiHidIo {
     boot_services: &'static dyn UefiBootServices,
     agent: efi::Handle,
     controller: efi::Handle,
-    owned: bool
+    owned: bool,
   ) -> Result<Self, efi::Status> {
     let mut hid_io_ptr: *mut hid_io::protocol::Protocol = core::ptr::null_mut();
 
