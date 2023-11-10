@@ -15,7 +15,7 @@ use r_efi::{efi, hii, protocols};
 use crate::{
   boot_services::UefiBootServices,
   hid_io::{HidIo, HidIoFactory, HidReportReciever, UefiHidIoFactory},
-  key_queue,
+  key_queue::{self, OrdKeyData},
 };
 
 #[cfg(not(test))]
@@ -102,6 +102,8 @@ pub struct KeyboardHidHandler {
   current_keys: BTreeSet<Usage>,
   led_state: BTreeSet<Usage>,
   key_queue: key_queue::KeyQueue,
+  notification_callbacks: BTreeMap<usize, (OrdKeyData, protocols::simple_text_input_ex::KeyNotifyFunction)>,
+  next_notify_handle: usize,
   key_notify_event: efi::Event,
   layout_change_event: efi::Event,
   layout_context: *mut LayoutChangeContext,
@@ -120,6 +122,8 @@ impl KeyboardHidHandler {
       current_keys: BTreeSet::new(),
       led_state: BTreeSet::new(),
       key_queue: Default::default(),
+      notification_callbacks: BTreeMap::new(),
+      next_notify_handle: 0,
       key_notify_event: core::ptr::null_mut(),
       layout_change_event: core::ptr::null_mut(),
       layout_context: core::ptr::null_mut(),
@@ -1014,12 +1018,43 @@ extern "efiapi" fn simple_text_in_ex_set_state(
 
 // registers a key notification callback function - part of the simple_text_in_ex protocol interface.
 extern "efiapi" fn simple_text_in_ex_register_key_notify(
-  _this: *mut protocols::simple_text_input_ex::Protocol,
-  _key_data_ptr: *mut protocols::simple_text_input_ex::KeyData,
-  _key_notification_function: protocols::simple_text_input_ex::KeyNotifyFunction,
-  _notify_handle: *mut *mut c_void,
+  this: *mut protocols::simple_text_input_ex::Protocol,
+  key_data_ptr: *mut protocols::simple_text_input_ex::KeyData,
+  key_notification_function: protocols::simple_text_input_ex::KeyNotifyFunction,
+  notify_handle: *mut *mut c_void,
 ) -> efi::Status {
-  todo!();
+  if this.is_null() || key_data_ptr.is_null() || notify_handle.is_null() || key_notification_function as usize == 0 {
+    return efi::Status::INVALID_PARAMETER;
+  }
+
+  let context = unsafe { (this as *mut SimpleTextInExContext).as_mut() }.expect("bad pointer");
+  let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+  let status;
+  'register_notify_processing: {
+    if let Some(keyboard_handler) = unsafe { context.keyboard_handler.as_mut() } {
+      let key_data = OrdKeyData(unsafe { key_data_ptr.read() });
+      for (handle, entry) in &keyboard_handler.notification_callbacks {
+        if entry.0 == key_data && entry.1 == key_notification_function {
+          //if callback already exists, just return current handle.
+          unsafe { notify_handle.write(*handle as *mut c_void) };
+          status = efi::Status::SUCCESS;
+          break 'register_notify_processing;
+        }
+      }
+      // key_data/callback combo doesn't already exist; create a new registration for it.
+      keyboard_handler.next_notify_handle += 1;
+      keyboard_handler
+        .notification_callbacks
+        .insert(keyboard_handler.next_notify_handle, (key_data.clone(), key_notification_function));
+      keyboard_handler.key_queue.add_notify_key(key_data);
+      unsafe { notify_handle.write(keyboard_handler.next_notify_handle as *mut c_void)};
+      status = efi::Status::SUCCESS;
+    } else {
+      status = efi::Status::DEVICE_ERROR;
+    }
+  }
+  context.boot_services.restore_tpl(old_tpl);
+  status
 }
 
 // unregisters a key notification callback function - part of the simple_text_in_ex protocol interface.
@@ -1065,8 +1100,39 @@ extern "efiapi" fn simple_text_in_ex_wait_for_key(event: efi::Event, context: *m
 
 // Event callback function for handling registered key notifications. Iterates over the queue of keys to be notified,
 // and invokes the registered callback function for each of those keys.
-extern "efiapi" fn process_key_notifies(_event: efi::Event, _context: *mut c_void) {
-  todo!()
+extern "efiapi" fn process_key_notifies(_event: efi::Event, context: *mut c_void) {
+  if let Some(context) = unsafe { (context as *mut SimpleTextInExContext).as_mut() } {
+    loop {
+      let mut pending_key = None;
+      let mut pending_callbacks = Vec::new();
+      let old_tpl = context.boot_services.raise_tpl(efi::TPL_NOTIFY);
+      if let Some(keyboard_handler) = unsafe { context.keyboard_handler.as_mut() } {
+        if let Some(pending_notify_key) = keyboard_handler.key_queue.pop_notifiy_key() {
+          pending_key = Some(pending_notify_key);
+          for (key, callback) in keyboard_handler.notification_callbacks.values() {
+            if OrdKeyData(pending_notify_key).matches_registered_key(key) {
+              pending_callbacks.push(callback);
+            }
+          }
+        }
+      } else {
+        #[cfg(not(test))]
+        debugln!(DEBUG_ERROR, "process_key_notifies event called without a valid keyboard_handler");
+      }
+      context.boot_services.restore_tpl(old_tpl);
+
+      //dispatch notifies (if any) at the TPL this event callback was invoked at.
+      if let Some(mut pending_key) = pending_key {
+        let key_ptr = &mut pending_key as *mut protocols::simple_text_input_ex::KeyData;
+        for callback in pending_callbacks {
+          let _ = callback(key_ptr);
+        }
+      } else {
+        // no pending notifies to process
+        break;
+      }
+    }
+  }
 }
 
 extern "efiapi" fn on_layout_update(_event: efi::Event, context: *mut c_void) {
@@ -1164,7 +1230,7 @@ mod test {
       on_layout_update, process_key_notifies, simple_text_in_ex_read_key_stroke, simple_text_in_ex_register_key_notify,
       simple_text_in_ex_reset, simple_text_in_ex_set_state, simple_text_in_ex_unregister_key_notify,
       simple_text_in_ex_wait_for_key, simple_text_in_wait_for_key, KeyboardHidHandler, SimpleTextInExContext,
-    },
+    }, key_queue::OrdKeyData,
   };
 
   use super::{simple_text_in_read_key_stroke, simple_text_in_reset, LayoutChangeContext, SimpleTextInContext};
@@ -2192,6 +2258,103 @@ mod test {
       );
 
       keyboard_handler.controller = None;
+    }
+
+    //drop the faux static boot services.
+    unsafe { drop(Box::from_raw(raw_boot_services)) };
+  }
+
+  #[test]
+  fn register_key_notify_should_register_a_notification_callback() {
+    // usage model for boot_services is global static, and so this implementation use &'static dyn UefiBootServices.
+    // to emulate this without actually creating a static, use a raw pointer.
+    let raw_boot_services = Box::into_raw(Box::new(MockUefiBootServices::new()));
+    let boot_services = unsafe { raw_boot_services.as_mut().unwrap() };
+
+    {
+      const NOTIFY_EVENT: efi::Event = 0x1 as efi::Event;
+      static mut SIMPLE_TEXT_IN_EX_CTX_PTR: *mut c_void = core::ptr::null_mut();
+      static mut KEY_NOTIFIED: bool = false;
+
+      boot_services.expect_raise_tpl().returning(|_| efi::TPL_APPLICATION);
+      boot_services.expect_restore_tpl().returning(|_| ());
+      boot_services.expect_signal_event()
+        .returning(|event| {
+          if event == NOTIFY_EVENT {
+            process_key_notifies(NOTIFY_EVENT, unsafe {SIMPLE_TEXT_IN_EX_CTX_PTR});            
+          }
+          efi::Status::SUCCESS
+        });
+
+      extern "efiapi" fn key_notify_callback (key_data: *mut protocols::simple_text_input_ex::KeyData) -> efi::Status {
+        let key = unsafe {key_data.read()};
+        assert_eq!(key.key.unicode_char, 'a' as u16);
+        unsafe {KEY_NOTIFIED = true};
+        efi::Status::SUCCESS
+      }
+
+      let agent = 0x1 as efi::Handle;
+      let mut keyboard_handler = KeyboardHidHandler::new(boot_services, agent);
+      let descriptor = hidparser::parse_report_descriptor(&BOOT_KEYBOARD_REPORT_DESCRIPTOR).unwrap();
+      keyboard_handler.process_descriptor(descriptor).unwrap();
+      keyboard_handler.key_queue.set_layout(Some(hii_keyboard_layout::get_default_keyboard_layout()));
+      keyboard_handler.key_notify_event = NOTIFY_EVENT;
+
+      let hid_io = MockHidIo::new();
+
+      let context_ex = SimpleTextInExContext {
+        simple_text_in_ex: protocols::simple_text_input_ex::Protocol {
+          reset: simple_text_in_ex_reset,
+          read_key_stroke_ex: simple_text_in_ex_read_key_stroke,
+          set_state: simple_text_in_ex_set_state,
+          register_key_notify: simple_text_in_ex_register_key_notify,
+          unregister_key_notify: simple_text_in_ex_unregister_key_notify,
+          wait_for_key_ex: core::ptr::null_mut(),
+        },
+        boot_services,
+        keyboard_handler: &mut keyboard_handler as *mut KeyboardHidHandler,
+      };
+
+      let context_ex_ptr = Box::into_raw(Box::new(context_ex));
+      unsafe {SIMPLE_TEXT_IN_EX_CTX_PTR = context_ex_ptr as *mut c_void};
+
+      let mut key_data: protocols::simple_text_input_ex::KeyData = Default::default();  
+      key_data.key.unicode_char = 'a' as u16;
+
+      let mut notify_handle = core::ptr::null_mut();
+
+      let status = simple_text_in_ex_register_key_notify (
+        context_ex_ptr as *mut protocols::simple_text_input_ex::Protocol, 
+        &mut key_data as *mut protocols::simple_text_input_ex::KeyData, 
+        key_notify_callback, 
+        core::ptr::addr_of_mut!(notify_handle));
+
+      assert_eq!(status, efi::Status::SUCCESS);
+      assert_eq!(keyboard_handler.notification_callbacks.len(), 1);
+      assert!(keyboard_handler.notification_callbacks.contains_key(&1));
+      assert_eq!(keyboard_handler.notification_callbacks.get(&1).unwrap().0, OrdKeyData(key_data));
+      assert_eq!(keyboard_handler.next_notify_handle, 1);
+      assert_eq!(notify_handle as usize, 1);
+
+      //send 'b'
+      let report: &[u8] = &[0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      //release
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      assert!(!unsafe {KEY_NOTIFIED});
+
+      //send 'a'
+      let report: &[u8] = &[0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+
+      //release
+      let report: &[u8] = &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+      keyboard_handler.receive_report(report, &hid_io);
+      assert!(unsafe {KEY_NOTIFIED});
+
+      drop(unsafe{Box::from_raw(context_ex_ptr)});
     }
 
     //drop the faux static boot services.
