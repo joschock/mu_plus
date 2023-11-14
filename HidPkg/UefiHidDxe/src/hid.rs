@@ -123,6 +123,8 @@ extern "efiapi" fn on_input_report(report_buffer_size: u16, report_buffer: *mut 
 
   let report = unsafe { from_raw_parts(report_buffer as *mut u8, report_buffer_size as usize) };
 
+  debugln!(DEBUG_INFO, "on_input_report: {:?}: {:x?}", line!(), report);
+
   let keyboard_context = unsafe { hid_context.keyboard_context.as_mut() };
   if let Some(keyboard_context) = keyboard_context {
     keyboard_context.handler.process_input_report(report);

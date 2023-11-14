@@ -392,6 +392,8 @@ pub fn initialize(
 ) -> Result<*mut PointerContext, efi::Status> {
   let handler = PointerHandler::process_descriptor(descriptor)?;
 
+  debugln!(DEBUG_INFO, "pointer::initialize: {:?}: {:x?}", line!(), handler);
+
   let context = handler.install_pointer_interfaces(controller, hid_context_ptr)?;
 
   let hid_context = unsafe { hid_context_ptr.as_mut().expect("[pointer::initialize]: bad hid context pointer") };
