@@ -146,21 +146,39 @@ AdvancedLoggerGetLoggerInfo (
       if (GuidHob != NULL) {
         LogPtr      = (ADVANCED_LOGGER_PTR *)GET_GUID_HOB_DATA (GuidHob);
         mLoggerInfo = ALI_FROM_PA (LogPtr->LogBuffer);
-        if (!mLoggerInfo->HdwPortInitialized) {
-          AdvancedLoggerHdwPortInitialize ();
-          mLoggerInfo->HdwPortInitialized = TRUE;
-        }
       }
     }
 
     if (mLoggerInfo != NULL) {
       mMaxAddress = mLoggerInfo->LogBuffer + mLoggerInfo->LogBufferSize;
       mBufferSize = mLoggerInfo->LogBufferSize;
+    } else {
+      // Logger not found from previous phase, so instantiate it here.
+      mLoggerInfo = (ADVANCED_LOGGER_INFO *)AllocateReservedPages (FixedPcdGet32 (PcdAdvancedLoggerPages));
+      if (mLoggerInfo != NULL) {
+        ZeroMem ((VOID *)mLoggerInfo, sizeof (ADVANCED_LOGGER_INFO));
+        mLoggerInfo->Signature     = ADVANCED_LOGGER_SIGNATURE;
+        mLoggerInfo->Version       = ADVANCED_LOGGER_VERSION;
+        mLoggerInfo->LogBuffer     = PA_FROM_PTR (mLoggerInfo + 1);
+        mLoggerInfo->LogBufferSize = EFI_PAGES_TO_SIZE (FixedPcdGet32 (PcdAdvancedLoggerPages)) - sizeof (ADVANCED_LOGGER_INFO);
+        mLoggerInfo->LogCurrent    = mLoggerInfo->LogBuffer;
+        mLoggerInfo->HwPrintLevel  = FixedPcdGet32 (PcdAdvancedLoggerHdwPortDebugPrintErrorLevel);
+        mMaxAddress                = mLoggerInfo->LogBuffer + mLoggerInfo->LogBufferSize;
+        mBufferSize                = mLoggerInfo->LogBufferSize;
+      } else {
+        DEBUG ((DEBUG_ERROR, "%a: Error allocating Advanced Logger Buffer\n", __FUNCTION__));
+      }
     }
   }
 
   if (((mLoggerInfo) != NULL) && !ValidateInfoBlock ()) {
     mLoggerInfo = NULL;
+  } else {
+    // Logger is good - make sure that hardware port is initialized for this phase.
+    if (!mLoggerInfo->HdwPortInitialized) {
+      AdvancedLoggerHdwPortInitialize ();
+      mLoggerInfo->HdwPortInitialized = TRUE;
+    }
   }
 
   return mLoggerInfo;
@@ -365,35 +383,14 @@ DxeCoreAdvancedLoggerLibConstructor (
   IN EFI_SYSTEM_TABLE  *SystemTable
   )
 {
-  ADVANCED_LOGGER_INFO  *LoggerInfo;
-  EFI_STATUS            Status;
+  EFI_STATUS  Status;
 
-  LoggerInfo = AdvancedLoggerGetLoggerInfo ();      // Sets mLoggerInfo if Logger Information block found in HOB.
+  // Sets mLoggerInfo if Logger Information block found in HOB or instantiates it if
+  // it doesn't exist.
+  AdvancedLoggerGetLoggerInfo ();
 
-  //
-  // For an implementation of the AdvancedLogger with a PEI implementation, there will be a
-  // Logger Information block published and available.
-  //
-  if (LoggerInfo == NULL) {
-    LoggerInfo = (ADVANCED_LOGGER_INFO *)AllocateReservedPages (FixedPcdGet32 (PcdAdvancedLoggerPages));
-    if (LoggerInfo != NULL) {
-      ZeroMem ((VOID *)LoggerInfo, sizeof (ADVANCED_LOGGER_INFO));
-      LoggerInfo->Signature     = ADVANCED_LOGGER_SIGNATURE;
-      LoggerInfo->Version       = ADVANCED_LOGGER_VERSION;
-      LoggerInfo->LogBuffer     = PA_FROM_PTR (LoggerInfo + 1);
-      LoggerInfo->LogBufferSize = EFI_PAGES_TO_SIZE (FixedPcdGet32 (PcdAdvancedLoggerPages)) - sizeof (ADVANCED_LOGGER_INFO);
-      LoggerInfo->LogCurrent    = LoggerInfo->LogBuffer;
-      LoggerInfo->HwPrintLevel  = FixedPcdGet32 (PcdAdvancedLoggerHdwPortDebugPrintErrorLevel);
-      mMaxAddress               = LoggerInfo->LogBuffer + LoggerInfo->LogBufferSize;
-      mBufferSize               = LoggerInfo->LogBufferSize;
-    } else {
-      DEBUG ((DEBUG_ERROR, "%a: Error allocating Advanced Logger Buffer\n", __FUNCTION__));
-    }
-  }
-
-  mLoggerInfo = LoggerInfo;
-  if (LoggerInfo != NULL) {
-    mAdvLoggerProtocol.LoggerInfo = LoggerInfo;
+  if (mLoggerInfo != NULL) {
+    mAdvLoggerProtocol.LoggerInfo = mLoggerInfo;
     mLoggerInfo->TimerFrequency   = GetPerformanceCounterProperties (NULL, NULL);
     Status                        = SystemTable->BootServices->InstallProtocolInterface (
                                                                  &ImageHandle,
