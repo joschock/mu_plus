@@ -19,6 +19,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::sync::atomic::Ordering;
 use core::{ffi::c_void, ptr};
 
 use r_efi::{efi, hii, protocols};
@@ -31,6 +32,7 @@ use mu_rust_helpers::function;
 use rust_advanced_logger_dxe::{DEBUG_ERROR, DEBUG_VERBOSE, DEBUG_WARN, debugln};
 
 use crate::{
+    RUNTIME_SERVICES,
     boot_services::UefiBootServices,
     hid_io::{HidIo, HidReportReceiver},
     keyboard::key_queue::OrdKeyData,
@@ -542,6 +544,18 @@ impl KeyboardHidHandler {
     }
 }
 
+// Notification function called when Ctrl-Alt-Delete is pressed.
+extern "efiapi" fn reset_notification_function(
+    _key_data: *mut protocols::simple_text_input_ex::KeyData,
+) -> efi::Status {
+    //handle ctrl-alt-delete
+    debugln!(DEBUG_WARN, "Ctrl-Alt-Del pressed, resetting system.");
+    if let Some(runtime_services) = unsafe { RUNTIME_SERVICES.load(Ordering::SeqCst).as_mut() } {
+        (runtime_services.reset_system)(efi::RESET_WARM, efi::Status::SUCCESS, 0, core::ptr::null_mut());
+    }
+    panic!("Reset failed.");
+}
+
 impl HidReportReceiver for KeyboardHidHandler {
     fn initialize(&mut self, controller: efi::Handle, hid_io: &dyn HidIo) -> Result<(), efi::Status> {
         let descriptor = hid_io.get_report_descriptor()?;
@@ -549,6 +563,19 @@ impl HidReportReceiver for KeyboardHidHandler {
         self.reset(true)?;
         self.install_protocol_interfaces(controller)?;
         self.initialize_keyboard_layout()?;
+
+        // Register a Ctrl-Alt-Delete handler to reset the system.
+        let reset_key_data = protocols::simple_text_input_ex::KeyData {
+            key: protocols::simple_text_input::InputKey { scan_code: key_queue::SCAN_DELETE, unicode_char: 0 },
+            key_state: protocols::simple_text_input_ex::KeyState {
+                key_toggle_state: 0,
+                key_shift_state: protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED
+                    | protocols::simple_text_input_ex::LEFT_ALT_PRESSED,
+            },
+        };
+
+        let _ = self.insert_key_notify_callback(reset_key_data, reset_notification_function);
+
         Ok(())
     }
 
