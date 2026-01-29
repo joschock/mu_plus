@@ -569,7 +569,8 @@ impl HidReportReceiver for KeyboardHidHandler {
             key: protocols::simple_text_input::InputKey { scan_code: key_queue::SCAN_DELETE, unicode_char: 0 },
             key_state: protocols::simple_text_input_ex::KeyState {
                 key_toggle_state: 0,
-                key_shift_state: protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED
+                key_shift_state: protocols::simple_text_input_ex::SHIFT_STATE_VALID
+                    | protocols::simple_text_input_ex::LEFT_CONTROL_PRESSED
                     | protocols::simple_text_input_ex::LEFT_ALT_PRESSED,
             },
         };
